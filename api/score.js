@@ -5,12 +5,14 @@ const LIVE_MARKER_CANDIDATES = ["miniscore", "matchScoreDetails", "liveApiData",
 const RECENT_KEY_CANDIDATES = ["recentOvsStats", "recentOvers", "recentBalls", "recentScores", "recent"];
 const SQUAD_TEAM_KEYS = ["team1", "team2"];
 const PLAYER_LIST_KEYS = ["players", "playerList", "squad", "playing11", "playingXI", "playersList"];
-const NEWS_PATH_PREFIX = "/cricket-news";
-const GALLERY_PATH_PREFIX = "/cricket-gallery";
 
-// Win probability marker (commentary/highlights extraction has been removed).
+// Commentary feed + win probability markers. Commentary is reduced to a
+// single "current ball" snapshot that overwrites itself every poll instead
+// of accumulating a growing list.
+const COMMENTARY_MARKER = "matchCommentary";
 const WIN_PROBABILITY_MARKER = "winProbability";
-const EXTRA_LIVE_MARKERS = [WIN_PROBABILITY_MARKER];
+const EXTRA_LIVE_MARKERS = [COMMENTARY_MARKER, WIN_PROBABILITY_MARKER];
+const RUN_WORD_LABELS = { one: "1 run", two: "2 runs", three: "3 runs", five: "5 runs" };
 
 const MAX_HTML_BYTES = 6 * 1024 * 1024;
 const MAX_CHUNKS = 400;
@@ -168,6 +170,7 @@ module.exports = async function handler(req, res) {
     }
 
     const matchInfo = extractMatchInfo(data.matchHeader || {});
+    const fullScore = buildFullScoreSummary(scoreCards);
 
     let squads;
     const directParsed = findSquadsObjectDirect(squadsRaw, squadsCache);
@@ -192,6 +195,7 @@ module.exports = async function handler(req, res) {
       team: nf(battingTeam),
       score: `${runs}/${wickets}`,
       overs,
+      matchScore: fullScore, // e.g. "SL 284 & 175/6 vs IND 462 & 193"
       batsmen: batsmen.map((b) => ({ name: nf(b.name), score: nf(b.score) })),
       bowler: nf(bowlerName),
       recent: nf(recent),
@@ -227,72 +231,19 @@ module.exports = async function handler(req, res) {
       );
       result.winProbability = winProb || NF;
 
-      const ldLive = extractJsonLdSidebars(liveHtml);
-      const ldScorecard = extractJsonLdSidebars(html);
-
-      let videosFinal = [];
-      const videoListRaw =
-        findArrayMarkerLazy(liveRaw, liveCache, "videoList", undefined) ||
-        findArrayMarkerLazy(scorecardRaw, scorecardCache, "videoList", undefined);
-
-      if (Array.isArray(videoListRaw) && videoListRaw.length > 0) {
-        videosFinal = videoListRaw
-          .map((entry) => entry && entry.video)
-          .filter(Boolean)
-          .map((v) => ({
-            title: nf(v.title),
-            duration: nf(v.durationStr),
-            videoType: nf(v.videoType),
-            link: nf(v.videoUrl),
-            thumbnailId: nf(v.imageId),
-            thumbnail: NF,
-          }));
-      } else {
-        const ldVideos = ldLive.videos.length ? ldLive.videos : ldScorecard.videos;
-        const matchVideosMeta = (() => {
-          const a = extractMatchVideosMeta(liveRaw, liveCache);
-          return a.length ? a : extractMatchVideosMeta(scorecardRaw, scorecardCache);
-        })();
-        videosFinal = ldVideos.map((v) => {
-          const idMatch = String(v.link || "").match(/cricket-videos\/(\d+)\//);
-          const meta = idMatch ? matchVideosMeta.find((mm) => String(mm.id) === idMatch[1]) : null;
-          return {
-            title: nf(v.title),
-            duration: nf(v.duration),
-            videoType: nf(meta && meta.videoType),
-            link: nf(v.link),
-            thumbnailId: NF,
-            thumbnail: nf(v.thumbnail),
-          };
-        });
-      }
-
-      videosFinal = videosFinal.slice(0, 10);
-      const pressConferenceVideos = videosFinal.filter((v) => String(v.videoType).toLowerCase().includes("press"));
-
-      let newsArticles = extractLinkedItems(liveHtml, NEWS_PATH_PREFIX, 8);
-      if (newsArticles.length === 0) newsArticles = extractLinkedItems(html, NEWS_PATH_PREFIX, 8);
-      newsArticles = newsArticles.map((n) => ({ title: nf(n.title), link: nf(n.link), date: NF }));
-
-      let photoGallery = extractLinkedItems(liveHtml, GALLERY_PATH_PREFIX, 8);
-      if (photoGallery.length === 0) photoGallery = extractLinkedItems(html, GALLERY_PATH_PREFIX, 8);
-      const ldPhotos = ldLive.photos.length ? ldLive.photos : ldScorecard.photos;
-      photoGallery = photoGallery.map((p) => {
-        const match = ldPhotos.find((lp) => lp.title === p.title);
-        return { title: nf(p.title), link: nf(p.link), date: nf(match && match.date) };
-      });
-
-      result.media = {
-        pressConferenceVideos: pressConferenceVideos.length ? pressConferenceVideos : NF,
-        news: newsArticles.length ? newsArticles : NF,
-        photos: photoGallery.length ? photoGallery : NF,
-      };
+      // Current ball snapshot only (four / six / wicket / dot / N run) —
+      // overwrites in place every poll, never accumulates a list.
+      const commentaryData =
+        findMarkerLazy(liveRaw, liveCache, COMMENTARY_MARKER, liveMarkerIndex.get(COMMENTARY_MARKER)) ||
+        findMarkerLazy(scorecardRaw, scorecardCache, COMMENTARY_MARKER, scorecardMarkerIndex.get(COMMENTARY_MARKER));
+      const currentBall = extractCurrentBall(commentaryData);
+      result.commentary = currentBall || NF;
     } catch (e) {
       if (!result.matchMeta) result.matchMeta = NF;
       if (!result.officials) result.officials = NF;
       if (!result.keyStats) result.keyStats = NF;
       if (!result.winProbability) result.winProbability = NF;
-      if (!result.media) result.media = NF;
+      if (!result.commentary) result.commentary = NF;
     }
 
     CACHE = { data: result, expires: Date.now() + CACHE_TTL_MS };
@@ -316,6 +267,37 @@ function extractMatchInfo(matchHeader) {
   const venueParts = [venueObj.ground || venueObj.name, venueObj.city].filter(Boolean);
   const venue = venueParts.length ? venueParts.join(", ") : NF;
   return { match, toss, venue };
+}
+
+// ---------------------------------------------------------------------
+// Full match score across all innings, per team, e.g.
+// "SL 284 & 175/6 vs IND 462 & 193"
+// ---------------------------------------------------------------------
+function formatInningsScore(scoreDetails) {
+  const sd = scoreDetails || {};
+  const runs = sd.runs ?? 0;
+  const wickets = sd.wickets ?? 0;
+  const isDeclared = sd.declared === true || sd.isDeclared === true;
+  let str = wickets >= 10 ? `${runs}` : `${runs}/${wickets}`;
+  if (isDeclared) str += "d";
+  return str;
+}
+
+function buildFullScoreSummary(scoreCards) {
+  const order = [];
+  const byTeam = new Map();
+  for (const card of scoreCards || []) {
+    const teamDetails = card.batTeamDetails || {};
+    const teamName = teamDetails.batTeamShortName || teamDetails.batTeamName || "";
+    if (!teamName) continue;
+    if (!byTeam.has(teamName)) {
+      byTeam.set(teamName, []);
+      order.push(teamName);
+    }
+    byTeam.get(teamName).push(formatInningsScore(card.scoreDetails));
+  }
+  if (order.length === 0) return NF;
+  return order.map((team) => `${team} ${byTeam.get(team).join(" & ")}`).join(" vs ");
 }
 
 function findBalancedEnd(str, startIdx, openChar, closeChar) {
@@ -710,71 +692,44 @@ function extractWinProbability(wp) {
   };
 }
 
-function findArrayMarkerLazy(rawChunks, cache, marker, candidateIndices) {
-  const indices = candidateIndices || rawChunks.map((_, i) => i);
-  for (const i of indices) {
-    const decoded = decodeChunk(rawChunks, i, cache);
-    const idx = decoded.indexOf(`"${marker}":[`);
-    if (idx === -1) continue;
-    const bracketStart = decoded.indexOf("[", idx);
-    if (bracketStart === -1) continue;
-    const end = findBalancedEnd(decoded, bracketStart, "[", "]");
-    if (end === -1) continue;
-    try { return JSON.parse(decoded.slice(bracketStart, end + 1)); } catch (e) { continue; }
-  }
-  return null;
+// ---------------------------------------------------------------------
+// Current ball only: four / six / wicket / dot / "N run(s)" / extras.
+// Always a single object that overwrites itself — never a growing list.
+// ---------------------------------------------------------------------
+function stripHtmlTags(str) {
+  return String(str || "").replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
 }
 
-function extractMatchVideosMeta(rawChunks, cache) {
-  const arr = findArrayMarkerLazy(rawChunks, cache, "matchVideos", undefined);
-  if (!Array.isArray(arr)) return [];
-  return arr
-    .map((v) => ({ id: v && v.id, title: v && v.title, videoType: (v && v.videoType) || undefined }))
-    .filter((v) => v.id);
+function classifyBallType(entry) {
+  const events = Array.isArray(entry.event) ? entry.event.map((e) => String(e).toLowerCase()) : [];
+  if (events.includes("wicket")) return "wicket";
+  if (events.includes("six")) return "six";
+  if (events.includes("four")) return "four";
+  if (events.includes("wide")) return "wide";
+  if (events.includes("noball") || events.includes("no-ball") || events.includes("no_ball")) return "no ball";
+  if (events.includes("bye")) return "bye";
+  if (events.includes("legbye") || events.includes("leg-bye") || events.includes("leg_bye")) return "leg bye";
+  if (events.includes("penalty")) return "penalty";
+  for (const word of Object.keys(RUN_WORD_LABELS)) {
+    if (events.includes(word)) return RUN_WORD_LABELS[word];
+  }
+  return "dot";
 }
 
-function extractJsonLdSidebars(rawHtml) {
-  const out = { newsArticles: [], photos: [], videos: [] };
-  if (!rawHtml) return out;
-  const scriptRe = /<script type="application\/ld\+json">([\s\S]*?)<\/script>/g;
-  let m;
-  while ((m = scriptRe.exec(rawHtml)) !== null) {
-    let obj;
-    try { obj = JSON.parse(m[1]); } catch (e) { continue; }
-    if (!obj || obj["@type"] !== "WPSideBar" || !Array.isArray(obj.mainEntityOfPage)) continue;
-    for (const item of obj.mainEntityOfPage) {
-      if (!item || typeof item !== "object") continue;
-      if (item["@type"] === "NewsArticle") {
-        out.newsArticles.push({ title: item.name, image: item.image });
-      } else if (item["@type"] === "ImageObject") {
-        out.photos.push({ title: item.name, image: item.image, date: item.datePublished });
-      } else if (item["@type"] === "VideoObject") {
-        out.videos.push({
-          title: item.name,
-          duration: item.duration,
-          link: item.contentUrl,
-          thumbnail: item.thumbnailUrl,
-          date: item.datePublished,
-        });
-      }
-    }
-  }
-  return out;
-}
+function extractCurrentBall(commData) {
+  if (!commData || typeof commData !== "object") return null;
+  const entries = Object.values(commData)
+    .filter((e) => e && typeof e === "object" && e.commType === "commentary" && typeof e.ballMetric === "number")
+    .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+  if (entries.length === 0) return null;
 
-function extractLinkedItems(rawHtml, pathPrefix, maxResults) {
-  maxResults = maxResults || 8;
-  const items = [];
-  if (!rawHtml) return items;
-  const re = new RegExp('href="(' + escapeRegex(pathPrefix) + '\\/[^"]+)"[^>]*>[\\s\\S]{0,2000}?class="mb-2\\.5">([^<]{2,200})<', "g");
-  let m;
-  const seen = new Set();
-  while ((m = re.exec(rawHtml)) !== null && items.length < maxResults) {
-    const link = m[1];
-    const title = m[2].trim();
-    if (seen.has(link) || !title) continue;
-    seen.add(link);
-    items.push({ title, link: "https://www.cricbuzz.com" + link });
-  }
-  return items;
+  const entry = entries[0];
+  return {
+    over: String(entry.ballMetric),
+    ball: classifyBallType(entry),
+    text: nf(stripHtmlTags(entry.commText)),
+    batsman: nf(entry.batsmanDetails && entry.batsmanDetails.playerName),
+    bowler: nf(entry.bowlerDetails && entry.bowlerDetails.playerName),
+    team: nf(entry.teamName),
+  };
 }
