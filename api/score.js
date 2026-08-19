@@ -3,13 +3,14 @@
 // ================================================================
 //                  MATCH LINK EKA METHANATA DANNA
 // ================================================================
-const MATCH_URL = "https://www.cricbuzz.com/live-cricket-scores/163013/ind-vs-sl-1st-test-india-tour-of-sri-lanka-2026";
+const MATCH_URL = "https://www.cricbuzz.com/live-cricket-scores/154410/jkm-vs-snp-10th-match-caribbean-premier-league-2026";
 // ================================================================
 // ================================================================
 
 const SCORECARD_MARKER = "scorecardApiData";
 const LIVE_MARKER_CANDIDATES = ["miniscore", "matchScoreDetails", "liveApiData", "commentaryApiData", "faceoffApiData"];
 const RECENT_KEY_CANDIDATES = ["recentOvsStats", "recentOvers", "recentBalls", "recentScores", "recent"];
+const SQUAD_MARKER_CANDIDATES = ["matchSquadsData", "squadsApiData", "squadData", "matchSquadData", "teamSquadData"];
 const MAX_HTML_BYTES = 6 * 1024 * 1024;
 const MAX_CHUNKS = 400;
 
@@ -33,6 +34,7 @@ module.exports = async function handler(req, res) {
   const cacheBuster = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
   const scorecardUrl = `https://www.cricbuzz.com/live-cricket-scorecard/${matchId}?_cb=${cacheBuster}`;
   const liveScoresUrl = `https://www.cricbuzz.com/live-cricket-scores/${matchId}?_cb=${cacheBuster}`;
+  const squadsUrl = `https://www.cricbuzz.com/cricket-match-squads/${matchId}?_cb=${cacheBuster}`;
 
   const headers = {
     "User-Agent":
@@ -47,9 +49,10 @@ module.exports = async function handler(req, res) {
   const t0 = Date.now();
 
   try {
-    const [scorecardRes, liveRes] = await Promise.all([
+    const [scorecardRes, liveRes, squadsRes] = await Promise.all([
       fetch(scorecardUrl, { headers }),
       fetch(liveScoresUrl, { headers }).catch(() => null),
+      fetch(squadsUrl, { headers }).catch(() => null),
     ]);
 
     if (!scorecardRes.ok) {
@@ -57,23 +60,28 @@ module.exports = async function handler(req, res) {
     }
     const html = await scorecardRes.text();
     const liveHtml = liveRes && liveRes.ok ? await liveRes.text() : "";
+    const squadsHtml = squadsRes && squadsRes.ok ? await squadsRes.text() : "";
 
-    if (html.length > MAX_HTML_BYTES || liveHtml.length > MAX_HTML_BYTES) {
+    if (html.length > MAX_HTML_BYTES || liveHtml.length > MAX_HTML_BYTES || squadsHtml.length > MAX_HTML_BYTES) {
       return res.status(502).json({ status: "error", message: "page too large to process safely" });
     }
 
     let scorecardRaw = splitRawChunks(html);
     let liveRaw = liveHtml ? splitRawChunks(liveHtml) : [];
+    let squadsRaw = squadsHtml ? splitRawChunks(squadsHtml) : [];
     if (scorecardRaw.length > MAX_CHUNKS) scorecardRaw = scorecardRaw.slice(0, MAX_CHUNKS);
     if (liveRaw.length > MAX_CHUNKS) liveRaw = liveRaw.slice(0, MAX_CHUNKS);
+    if (squadsRaw.length > MAX_CHUNKS) squadsRaw = squadsRaw.slice(0, MAX_CHUNKS);
     const scorecardCache = new Map();
     const liveCache = new Map();
+    const squadsCache = new Map();
 
     if (scan) {
       return res.status(200).json({
         status: "debug",
         markers_found_scorecard_page: scanAllMarkers(scorecardRaw, scorecardCache),
         markers_found_live_scores_page: scanAllMarkers(liveRaw, liveCache),
+        markers_found_squads_page: scanAllMarkers(squadsRaw, squadsCache),
         fetch_and_split_ms: Date.now() - t0,
       });
     }
@@ -156,21 +164,42 @@ module.exports = async function handler(req, res) {
       }
     }
 
+    // Match / Toss / Venue — this all lives on matchHeader, which we
+    // already have from the scorecard page's scorecardApiData blob.
+    const matchInfo = extractMatchInfo(data.matchHeader || {});
+
+    // Squads (both teams' player lists) — separate page, best-effort.
+    let squadMarkerUsed = null;
+    let squadsRawData = null;
+    for (const marker of SQUAD_MARKER_CANDIDATES) {
+      let d = findMarkerLazy(squadsRaw, squadsCache, marker);
+      if (!d) d = findMarkerLazy(scorecardRaw, scorecardCache, marker);
+      if (d) { squadsRawData = d; squadMarkerUsed = marker; break; }
+    }
+    const squads = extractSquads(squadsRawData);
+
     const result = {
       status: "success",
+      match: matchInfo.match,
+      toss: matchInfo.toss,
+      venue: matchInfo.venue,
       team: battingTeam,
       score: `${runs}/${wickets}`,
       overs,
       batsmen,
       bowler: bowlerName,
       recent,
+      squads,
     };
 
     if (debug) {
       result.debug = {
         innings_count: scoreCards.length,
         match_status: (data.matchHeader && data.matchHeader.status) || "unknown",
+        match_header_keys: Object.keys(data.matchHeader || {}),
         live_blob_marker_used: liveBlob ? liveBlob.marker : null,
+        squad_marker_used: squadMarkerUsed,
+        squads_raw_top_level_keys: squadsRawData ? Object.keys(squadsRawData) : null,
         current_scorecard_top_level_keys: Object.keys(current),
         batsmen_extraction_debug: batDebug,
         recent_ticker_debug: recentHit || { note: "not found — try &debug=1&scan=1" },
@@ -186,6 +215,64 @@ module.exports = async function handler(req, res) {
     return res.status(500).send(JSON.stringify({ status: "error", message: String(e) }, null, 2));
   }
 };
+
+// Pulls "Match / Toss / Venue" out of matchHeader (already present in
+// scorecardApiData — no extra page fetch needed for this part). Tries a
+// few field-name variants defensively since Cricbuzz's exact shape can
+// shift between page builds.
+function extractMatchInfo(matchHeader) {
+  const team1Name = (matchHeader.team1 && (matchHeader.team1.shortName || matchHeader.team1.name)) || "";
+  const team2Name = (matchHeader.team2 && (matchHeader.team2.shortName || matchHeader.team2.name)) || "";
+  const seriesName = (matchHeader.series && matchHeader.series.name) || matchHeader.seriesName || "";
+  const desc = matchHeader.matchDescription || matchHeader.matchFormat || "";
+
+  const matchParts = [team1Name && team2Name ? `${team1Name} vs ${team2Name}` : "", desc, seriesName].filter(Boolean);
+  const match = matchParts.length ? matchParts.join(" • ") : "not found";
+
+  const toss = matchHeader.tossResults
+    ? `${matchHeader.tossResults.tossWinnerName || "not found"} won the toss and opt to ${matchHeader.tossResults.decision || "not found"}`
+    : matchHeader.tossStatus || "not found";
+
+  const venueObj = matchHeader.venue || {};
+  const venueParts = [venueObj.ground || venueObj.name, venueObj.city].filter(Boolean);
+  const venue = venueParts.length ? venueParts.join(", ") : "not found";
+
+  return { match, toss, venue };
+}
+
+// Pulls both teams' squad/player lists out of the squads blob. The exact
+// shape isn't confirmed (see SQUAD_MARKER_CANDIDATES / &debug=1&scan=1 if
+// this comes back empty on your match), so this tries several common
+// container/field-name variants before giving up.
+function extractSquads(squadData) {
+  const empty = { team1: { name: "not found", players: [] }, team2: { name: "not found", players: [] } };
+  if (!squadData || typeof squadData !== "object") return empty;
+
+  const teamContainers = [];
+  for (const key of ["team1", "team2", "squad1", "squad2"]) {
+    if (squadData[key]) teamContainers.push(squadData[key]);
+  }
+  if (teamContainers.length === 0 && Array.isArray(squadData.squads)) {
+    teamContainers.push(...squadData.squads);
+  }
+  if (teamContainers.length === 0 && Array.isArray(squadData)) {
+    teamContainers.push(...squadData);
+  }
+  if (teamContainers.length === 0) return empty;
+
+  const parsed = teamContainers.slice(0, 2).map((teamObj) => {
+    const name = teamObj.teamName || teamObj.name || teamObj.shortName || "not found";
+    const rosterCandidates = [teamObj.players, teamObj.playerList, teamObj.squad, teamObj.playing11, teamObj.playersList];
+    const roster = rosterCandidates.find((r) => Array.isArray(r) && r.length > 0) || [];
+    const players = roster
+      .map((p) => (typeof p === "string" ? p : p.name || p.playerName || p.fullName || null))
+      .filter(Boolean);
+    return { name, players };
+  });
+
+  while (parsed.length < 2) parsed.push({ name: "not found", players: [] });
+  return { team1: parsed[0], team2: parsed[1] };
+}
 
 function extractBatsmen(current) {
   const teamNode = current.batTeamDetails || current.battingTeamDetails || current.batTeam || current.batting || {};
