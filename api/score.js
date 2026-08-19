@@ -3,7 +3,7 @@
 // ================================================================
 //                  MATCH LINK EKA METHANATA DANNA
 // ================================================================
-const MATCH_URL = "https://www.cricbuzz.com/live-cricket-scores/154410/jkm-vs-snp-10th-match-caribbean-premier-league-2026";
+const MATCH_URL = "https://www.cricbuzz.com/live-cricket-scores/163013/ind-vs-sl-1st-test-india-tour-of-sri-lanka-2026";
 // ================================================================
 // ================================================================
 
