@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/score.js": {
+      "maxDuration": 10
+    }
+  }
+}
