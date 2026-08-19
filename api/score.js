@@ -1,74 +1,16 @@
-// ==========================================================================
-// සිංහලෙන් පැහැදිලි කිරීම (මුලින්ම කියවන්න):
-//
-// Cricbuzz එකේ හැම match එකකටම වෙනස් link එකක් තියෙනවා. Match එක වෙනස් වුනාම
-// පහළ තියෙන DEFAULT_MATCH_LINK එකට අලුත් Cricbuzz link එකම paste කරන්න —
-// (id එක වෙනම හොයාගෙන දාන්න ඕන නෑ, පිටේ copy කරගත්ත link එකම දාන්න පුළුවන්,
-// scorecard page එකේ link එක වුනත්, live-scores page එකේ link එක වුනත්
-// දෙකම වැඩ කරනවා).
-//
-//   දැන් තියෙන්නේ:  DEFAULT_MATCH_LINK = "https://www.cricbuzz.com/live-cricket-scores/163013/..."
-//
-// අලුත් match එකක් enakota, Cricbuzz eke ee match eke link eka copy karala
-// mehema paste karanna:
-//
-//   DEFAULT_MATCH_LINK = "https://www.cricbuzz.com/live-cricket-scores/999999/team-a-vs-team-b-something"
-//
-// ඊට පස්සේ save කරලා GitHub එකට push කරනවා විතරයි — Vercel auto-deploy වෙනවා.
-//
-// ?id=  හෝ  ?link=  query param එකක් request එකේ දුන්නොත් ඒක DEFAULT_MATCH_LINK
-// එකට වඩා ප්‍රමුඛතාවය ගන්නවා — ඒත් daily use එකට ඕන වෙන්නේ මේ constant එකේ
-// link එක update කරන එක විතරයි.
-// ==========================================================================
-const DEFAULT_MATCH_LINK = "https://www.cricbuzz.com/live-cricket-scores/154410/jkm-vs-snp-10th-match-caribbean-premier-league-2026";
+// Cricbuzz eke match eke link eka methanata danna:
+const MATCH_URL = "https://www.cricbuzz.com/live-cricket-scores/163013/";
 
-// Pulls the numeric match id out of ANY Cricbuzz match URL — works for
-// both /live-cricket-scores/<id>/... and /live-cricket-scorecard/<id>/...
-// links, so you can paste whichever one you copied.
+const SCORECARD_MARKER = "scorecardApiData";
+const LIVE_MARKER_CANDIDATES = ["miniscore", "matchScoreDetails", "liveApiData", "commentaryApiData", "faceoffApiData"];
+const RECENT_KEY_CANDIDATES = ["recentOvsStats", "recentOvers", "recentBalls", "recentScores", "recent"];
+const MAX_HTML_BYTES = 6 * 1024 * 1024;
+const MAX_CHUNKS = 400;
+
 function extractMatchIdFromLink(link) {
-  if (!link) return null;
   const m = String(link).match(/cricbuzz\.com\/live-cricket-(?:scores|scorecard)\/(\d{4,20})\//);
   return m ? m[1] : null;
 }
-
-// Vercel Serverless Function (Node.js runtime) — Cricbuzz Live Score JSON API
-//
-// IMPORTANT: this file must live at  api/score.js  in your repo root so
-// Vercel picks it up automatically as a serverless function, reachable at:
-//   https://YOUR-PROJECT.vercel.app/api/score?id=163013
-//
-// WHY THIS FIXES THE 1102 ERRORS:
-//   Cloudflare Workers (Free plan) cap actual CPU execution time at 10ms
-//   per request — decoding/parsing a multi-MB Cricbuzz page blows past
-//   that almost every time.
-//   Vercel Serverless Functions on the Node.js runtime (the default here —
-//   NOT the Edge runtime) are limited by wall-clock TIME, not CPU-only
-//   time: 10 seconds on the free Hobby plan. Network waiting AND parsing
-//   both count toward that budget together, and 10s is enormously more
-//   than this workload needs. There is no separate 10ms CPU-only cap here.
-//
-// DO NOT add `export const config = { runtime: "edge" }` to this file —
-// that switches it back to an isolate-based runtime with CPU-time limits
-// similar to Cloudflare Workers, which defeats the point of this move.
-//
-// Usage:         https://YOUR-PROJECT.vercel.app/api/score?id=163013
-// Debug mode:    https://YOUR-PROJECT.vercel.app/api/score?id=163013&debug=1
-// Key-scan mode: https://YOUR-PROJECT.vercel.app/api/score?id=163013&debug=1&scan=1
-
-const SCORECARD_MARKER = "scorecardApiData";
-
-const LIVE_MARKER_CANDIDATES = [
-  "miniscore",
-  "matchScoreDetails",
-  "liveApiData",
-  "commentaryApiData",
-  "faceoffApiData",
-];
-
-const RECENT_KEY_CANDIDATES = ["recentOvsStats", "recentOvers", "recentBalls", "recentScores", "recent"];
-
-const MAX_HTML_BYTES = 6 * 1024 * 1024; // 6MB safety net per page
-const MAX_CHUNKS = 400; // safety net against a pathological number of push() chunks
 
 module.exports = async function handler(req, res) {
   const debug = req.query.debug === "1";
@@ -77,27 +19,9 @@ module.exports = async function handler(req, res) {
   res.setHeader("access-control-allow-origin", "*");
   res.setHeader("cache-control", "no-store");
 
-  let matchId = null;
-  let usedDefaultLink = false;
-  if (req.query.id) {
-    matchId = req.query.id.toString();
-  } else if (req.query.link) {
-    matchId = extractMatchIdFromLink(req.query.link.toString());
-  } else {
-    matchId = extractMatchIdFromLink(DEFAULT_MATCH_LINK);
-    usedDefaultLink = true;
-  }
-
+  const matchId = extractMatchIdFromLink(MATCH_URL);
   if (!matchId) {
-    return res.status(422).json({
-      status: "error",
-      message:
-        "could not get a match id — check DEFAULT_MATCH_LINK at the top of the file, or pass ?id= / ?link=",
-    });
-  }
-
-  if (!/^\d{4,20}$/.test(matchId)) {
-    return res.status(422).json({ status: "error", message: "invalid match id" });
+    return res.status(422).json({ status: "error", message: "invalid MATCH_URL at top of file" });
   }
 
   const cacheBuster = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -129,10 +53,7 @@ module.exports = async function handler(req, res) {
     const liveHtml = liveRes && liveRes.ok ? await liveRes.text() : "";
 
     if (html.length > MAX_HTML_BYTES || liveHtml.length > MAX_HTML_BYTES) {
-      return res.status(502).json({
-        status: "error",
-        message: `page too large to process safely (scorecard ${html.length}B, live ${liveHtml.length}B, limit ${MAX_HTML_BYTES}B) — likely a bot-check or malformed response from Cricbuzz`,
-      });
+      return res.status(502).json({ status: "error", message: "page too large to process safely" });
     }
 
     let scorecardRaw = splitRawChunks(html);
@@ -155,8 +76,7 @@ module.exports = async function handler(req, res) {
     if (!data) {
       return res.status(502).json({
         status: "error",
-        message:
-          "could not find/parse scorecardApiData blob (match may not have started or page structure changed)",
+        message: "could not find/parse scorecardApiData blob (match may not have started or page structure changed)",
       });
     }
 
@@ -187,12 +107,8 @@ module.exports = async function handler(req, res) {
     if (liveBlob && (liveBlob.data.batsmanStriker || liveBlob.data.batsmanNonStriker)) {
       const bs = liveBlob.data.batsmanStriker || {};
       const bns = liveBlob.data.batsmanNonStriker || {};
-      if (bs.batName) {
-        batsmen.push({ name: `${bs.batName} *`, score: `${bs.batRuns ?? 0}(${bs.batBalls ?? 0})` });
-      }
-      if (bns.batName) {
-        batsmen.push({ name: bns.batName, score: `${bns.batRuns ?? 0}(${bns.batBalls ?? 0})` });
-      }
+      if (bs.batName) batsmen.push({ name: `${bs.batName} *`, score: `${bs.batRuns ?? 0}(${bs.batBalls ?? 0})` });
+      if (bns.batName) batsmen.push({ name: bns.batName, score: `${bns.batRuns ?? 0}(${bns.batBalls ?? 0})` });
       const bwlStriker = liveBlob.data.bowlerStriker || {};
       if (bwlStriker.bowlName) bowlerName = bwlStriker.bowlName;
       if (liveBlob.data.recentOvsStats) recent = String(liveBlob.data.recentOvsStats);
@@ -216,10 +132,7 @@ module.exports = async function handler(req, res) {
         const bw = bowlersData[key];
         const ov = parseFloat(bw.overs ?? 0);
         if (!isNaN(ov) && ov % 1 !== 0) midOverBowler = bw.bowlName;
-        if (!isNaN(ov) && ov > bestOvers) {
-          bestOvers = ov;
-          bowlerName = bw.bowlName || "not found";
-        }
+        if (!isNaN(ov) && ov > bestOvers) { bestOvers = ov; bowlerName = bw.bowlName || "not found"; }
       }
       if (midOverBowler) bowlerName = midOverBowler;
     }
@@ -240,7 +153,6 @@ module.exports = async function handler(req, res) {
     const result = {
       status: "success",
       match_id: matchId,
-      auto_detected_match: usedDefaultLink,
       score: `${battingTeam} ${runs}/${wickets}`,
       overs,
       batsmen,
@@ -250,18 +162,12 @@ module.exports = async function handler(req, res) {
 
     if (debug) {
       result.debug = {
-        match_id: matchId,
         innings_count: scoreCards.length,
         match_status: (data.matchHeader && data.matchHeader.status) || "unknown",
         live_blob_marker_used: liveBlob ? liveBlob.marker : null,
         current_scorecard_top_level_keys: Object.keys(current),
         batsmen_extraction_debug: batDebug,
-        recent_ticker_debug:
-          recentHit || { note: "not found under any RECENT_KEY_CANDIDATES on either page — try &debug=1&scan=1" },
-        scorecard_chunks_total: scorecardRaw.length,
-        scorecard_chunks_decoded: scorecardCache.size,
-        live_chunks_total: liveRaw.length,
-        live_chunks_decoded: liveCache.size,
+        recent_ticker_debug: recentHit || { note: "not found — try &debug=1&scan=1" },
         total_ms: Date.now() - t0,
         fetched_at: new Date().toISOString(),
       };
@@ -271,31 +177,16 @@ module.exports = async function handler(req, res) {
   } catch (e) {
     return res.status(500).json({ status: "error", message: String(e) });
   }
-}
+};
 
 function extractBatsmen(current) {
-  const teamNode =
-    current.batTeamDetails ||
-    current.battingTeamDetails ||
-    current.batTeam ||
-    current.batting ||
-    {};
-
+  const teamNode = current.batTeamDetails || current.battingTeamDetails || current.batTeam || current.batting || {};
   const rosterCandidates = [
-    teamNode.batsmenData,
-    teamNode.batsmenList,
-    teamNode.batsman,
-    teamNode.batters,
-    teamNode.players,
-    current.batsmenData,
+    teamNode.batsmenData, teamNode.batsmenList, teamNode.batsman,
+    teamNode.batters, teamNode.players, current.batsmenData,
   ];
   const roster = rosterCandidates.find((r) => r && (Array.isArray(r) ? r.length > 0 : Object.keys(r).length > 0));
-
-  const debugInfo = {
-    bat_team_node_keys: Object.keys(teamNode),
-    roster_found: !!roster,
-  };
-
+  const debugInfo = { bat_team_node_keys: Object.keys(teamNode), roster_found: !!roster };
   if (!roster) return { batsmen: [], debugInfo };
 
   const entries = Array.isArray(roster) ? roster : Object.values(roster);
@@ -307,18 +198,13 @@ function extractBatsmen(current) {
     if (!b || typeof b !== "object") continue;
     const name = b.batName || b.name || b.batsman || b.playerName || b.fullName || null;
     if (!name) continue;
-
     const outDesc = b.outDesc ?? b.dismissal ?? b.outDescription ?? "";
-    const isOut =
-      b.isOut === true ||
-      (typeof outDesc === "string" && outDesc.trim().length > 0 && outDesc.trim().toLowerCase() !== "not out" && outDesc.trim().toLowerCase() !== "batting");
+    const isOut = b.isOut === true || (typeof outDesc === "string" && outDesc.trim().length > 0 && outDesc.trim().toLowerCase() !== "not out" && outDesc.trim().toLowerCase() !== "batting");
     if (isOut) continue;
-
     const runs = b.runs ?? b.batRuns ?? b.r ?? 0;
     const balls = b.balls ?? b.batBalls ?? b.b ?? 0;
     notOut.push({ name, score: `${runs}(${balls})` });
   }
-
   return { batsmen: notOut, debugInfo };
 }
 
@@ -328,16 +214,11 @@ function splitRawChunks(html) {
   while (true) {
     const start = html.indexOf("self.__next_f.push", searchFrom);
     if (start === -1) break;
-
     const rest = html.slice(start);
     const innerStart = rest.indexOf('"') + 1;
     let endIdx = rest.indexOf('"]\n', innerStart);
     if (endIdx === -1) endIdx = rest.indexOf('"])', innerStart);
-    if (endIdx === -1) {
-      searchFrom = start + 1;
-      continue;
-    }
-
+    if (endIdx === -1) { searchFrom = start + 1; continue; }
     chunks.push(rest.slice(innerStart, endIdx));
     searchFrom = start + endIdx;
   }
@@ -355,12 +236,7 @@ function decodeChunk(rawChunks, idx, cache) {
   try {
     decoded = JSON.parse('"' + rawEscaped + '"');
   } catch (e) {
-    decoded = rawEscaped
-      .replace(/\\n/g, "\n")
-      .replace(/\\t/g, "\t")
-      .replace(/\\"/g, '"')
-      .replace(/\\\//g, "/")
-      .replace(/\\\\/g, "\\");
+    decoded = rawEscaped.replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\"/g, '"').replace(/\\\//g, "/").replace(/\\\\/g, "\\");
   }
   cache.set(idx, decoded);
   return decoded;
@@ -374,27 +250,14 @@ function findMarkerLazy(rawChunks, cache, marker) {
     if (idx === -1) continue;
     const braceStart = decoded.indexOf("{", idx);
     if (braceStart === -1) continue;
-
-    let depth = 0;
-    let end = -1;
+    let depth = 0, end = -1;
     for (let j = braceStart; j < decoded.length; j++) {
       const c = decoded[j];
       if (c === "{") depth++;
-      else if (c === "}") {
-        depth--;
-        if (depth === 0) {
-          end = j;
-          break;
-        }
-      }
+      else if (c === "}") { depth--; if (depth === 0) { end = j; break; } }
     }
     if (end === -1) continue;
-
-    try {
-      return JSON.parse(decoded.slice(braceStart, end + 1));
-    } catch (e) {
-      continue;
-    }
+    try { return JSON.parse(decoded.slice(braceStart, end + 1)); } catch (e) { continue; }
   }
   return null;
 }
@@ -404,9 +267,7 @@ function findKeyLazy(rawChunks, cache, key, label) {
     if (!rawChunkMayContain(rawChunks[i], key)) continue;
     const decoded = decodeChunk(rawChunks, i, cache);
     const val = extractValueAfterKey(decoded, key);
-    if (val !== undefined && val !== null && String(val).length > 0) {
-      return { key, value: val, source: label };
-    }
+    if (val !== undefined && val !== null && String(val).length > 0) return { key, value: val, source: label };
   }
   return null;
 }
@@ -415,51 +276,28 @@ function extractValueAfterKey(chunk, key) {
   const marker = `"${key}":`;
   const idx = chunk.indexOf(marker);
   if (idx === -1) return undefined;
-
   let i = idx + marker.length;
   while (i < chunk.length && /\s/.test(chunk[i])) i++;
   const c = chunk[i];
 
   if (c === '"') {
-    let j = i + 1;
-    let out = "";
+    let j = i + 1, out = "";
     while (j < chunk.length && chunk[j] !== '"') {
-      if (chunk[j] === "\\") {
-        out += chunk[j] + (chunk[j + 1] || "");
-        j += 2;
-        continue;
-      }
-      out += chunk[j];
-      j++;
+      if (chunk[j] === "\\") { out += chunk[j] + (chunk[j + 1] || ""); j += 2; continue; }
+      out += chunk[j]; j++;
     }
-    try {
-      return JSON.parse('"' + out + '"');
-    } catch (e) {
-      return out;
-    }
+    try { return JSON.parse('"' + out + '"'); } catch (e) { return out; }
   }
 
   if (c === "[" || c === "{") {
-    const open = c;
-    const close = c === "[" ? "]" : "}";
-    let depth = 0;
-    let j = i;
+    const open = c, close = c === "[" ? "]" : "}";
+    let depth = 0, j = i;
     for (; j < chunk.length; j++) {
       if (chunk[j] === open) depth++;
-      else if (chunk[j] === close) {
-        depth--;
-        if (depth === 0) {
-          j++;
-          break;
-        }
-      }
+      else if (chunk[j] === close) { depth--; if (depth === 0) { j++; break; } }
     }
     const raw = chunk.slice(i, j);
-    try {
-      return JSON.parse(raw);
-    } catch (e) {
-      return raw;
-    }
+    try { return JSON.parse(raw); } catch (e) { return raw; }
   }
 
   let j = i;
