@@ -1,6 +1,6 @@
 const MATCH_URL =
   process.env.MATCH_URL ||
-  "https://www.cricbuzz.com/live-cricket-scores/163013/sl-vs-ind-1st-test-india-tour-of-sri-lanka-2026";
+  "https://www.cricbuzz.com/live-cricket-scores/129579/pak-vs-eng-1st-test-pakistan-tour-of-england-2026";
 
 const SCORECARD_MARKER = "scorecardApiData";
 const LIVE_MARKER_CANDIDATES = ["miniscore", "matchScoreDetails", "liveApiData", "commentaryApiData", "faceoffApiData"];
