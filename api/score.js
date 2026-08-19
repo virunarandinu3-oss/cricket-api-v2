@@ -8,13 +8,9 @@ const PLAYER_LIST_KEYS = ["players", "playerList", "squad", "playing11", "playin
 const NEWS_PATH_PREFIX = "/cricket-news";
 const GALLERY_PATH_PREFIX = "/cricket-gallery";
 
-// Commentary feed + win probability markers, and the vocabulary used to
-// classify each ball (four / six / wicket / dot) from its "event" tags.
-const COMMENTARY_MARKER = "matchCommentary";
+// Win probability marker (commentary/highlights extraction has been removed).
 const WIN_PROBABILITY_MARKER = "winProbability";
-const EXTRA_LIVE_MARKERS = [COMMENTARY_MARKER, WIN_PROBABILITY_MARKER];
-const RUN_EVENT_WORDS = ["one", "two", "three", "four", "five", "six", "wicket", "wide", "noball", "no-ball", "no_ball", "bye", "legbye", "leg-bye", "leg_bye", "penalty"];
-const COMMENTARY_EVENT_LIMIT = 8;
+const EXTRA_LIVE_MARKERS = [WIN_PROBABILITY_MARKER];
 
 const MAX_HTML_BYTES = 6 * 1024 * 1024;
 const MAX_CHUNKS = 400;
@@ -221,21 +217,6 @@ module.exports = async function handler(req, res) {
         referee: nf(extended.officials.referee),
       };
 
-      result.series = {
-        name: nf(extended.series.name),
-        result: nf(extended.series.result),
-        startDate: nf(extended.series.startDate),
-        endDate: nf(extended.series.endDate),
-      };
-
-      result.venueDetails = {
-        city: nf(extended.venueDetails.city),
-        country: nf(extended.venueDetails.country),
-        timezone: nf(extended.venueDetails.timezone),
-        latitude: nf(extended.venueDetails.latitude),
-        longitude: nf(extended.venueDetails.longitude),
-      };
-
       // Key Stats: partnership, last wicket, overs left, last 10 overs, toss
       result.keyStats = extractKeyStats(liveBlob ? liveBlob.data : null, data.matchHeader || {});
 
@@ -245,12 +226,6 @@ module.exports = async function handler(req, res) {
           findMarkerLazy(scorecardRaw, scorecardCache, WIN_PROBABILITY_MARKER, scorecardMarkerIndex.get(WIN_PROBABILITY_MARKER))
       );
       result.winProbability = winProb || NF;
-
-      // Ball-by-ball highlights split into four / six / wicket / dot
-      const commentaryData =
-        findMarkerLazy(liveRaw, liveCache, COMMENTARY_MARKER, liveMarkerIndex.get(COMMENTARY_MARKER)) ||
-        findMarkerLazy(scorecardRaw, scorecardCache, COMMENTARY_MARKER, scorecardMarkerIndex.get(COMMENTARY_MARKER));
-      result.commentary = extractCommentaryHighlights(commentaryData, COMMENTARY_EVENT_LIMIT) || NF;
 
       const ldLive = extractJsonLdSidebars(liveHtml);
       const ldScorecard = extractJsonLdSidebars(html);
@@ -294,7 +269,6 @@ module.exports = async function handler(req, res) {
 
       videosFinal = videosFinal.slice(0, 10);
       const pressConferenceVideos = videosFinal.filter((v) => String(v.videoType).toLowerCase().includes("press"));
-      const highlightVideos = videosFinal.filter((v) => !String(v.videoType).toLowerCase().includes("press"));
 
       let newsArticles = extractLinkedItems(liveHtml, NEWS_PATH_PREFIX, 8);
       if (newsArticles.length === 0) newsArticles = extractLinkedItems(html, NEWS_PATH_PREFIX, 8);
@@ -309,7 +283,6 @@ module.exports = async function handler(req, res) {
       });
 
       result.media = {
-        highlightVideos: highlightVideos.length ? highlightVideos : NF,
         pressConferenceVideos: pressConferenceVideos.length ? pressConferenceVideos : NF,
         news: newsArticles.length ? newsArticles : NF,
         photos: photoGallery.length ? photoGallery : NF,
@@ -317,11 +290,8 @@ module.exports = async function handler(req, res) {
     } catch (e) {
       if (!result.matchMeta) result.matchMeta = NF;
       if (!result.officials) result.officials = NF;
-      if (!result.series) result.series = NF;
-      if (!result.venueDetails) result.venueDetails = NF;
       if (!result.keyStats) result.keyStats = NF;
       if (!result.winProbability) result.winProbability = NF;
-      if (!result.commentary) result.commentary = NF;
       if (!result.media) result.media = NF;
     }
 
@@ -671,27 +641,9 @@ function formatPersonInfo(p) {
   return p.country ? `${name} (${p.country})` : name;
 }
 
-function formatEpochDate(ms) {
-  if (ms === undefined || ms === null || ms === "") return undefined;
-  try {
-    const d = new Date(Number(ms));
-    if (isNaN(d.getTime())) return undefined;
-    return d.toISOString().slice(0, 10);
-  } catch (e) {
-    return undefined;
-  }
-}
-
-function extractSeriesResultText(seriesObj) {
-  if (!seriesObj || typeof seriesObj !== "object") return undefined;
-  return seriesObj.testSeriesResult || seriesObj.odiSeriesResult || seriesObj.t20SeriesResult || undefined;
-}
-
 function extractExtendedMatchInfo(matchHeader, matchInfoBlob) {
   const mh = matchHeader || {};
   const mi = matchInfoBlob || {};
-  const venue = mi.venue || mh.venue || {};
-  const series = mi.series || {};
 
   return {
     meta: {
@@ -706,19 +658,6 @@ function extractExtendedMatchInfo(matchHeader, matchInfoBlob) {
       umpire2: formatPersonInfo(mi.umpire2 || mh.umpire2),
       umpire3: formatPersonInfo(mi.umpire3 || mh.umpire3),
       referee: formatPersonInfo(mi.referee || mh.referee),
-    },
-    series: {
-      name: firstDefined(mh.seriesName, series.name),
-      result: extractSeriesResultText(series),
-      startDate: formatEpochDate(firstDefined(series.startDate, mh.seriesStartDt)),
-      endDate: formatEpochDate(firstDefined(series.endDate, mh.seriesEndDt)),
-    },
-    venueDetails: {
-      city: firstDefined(venue.city),
-      country: firstDefined(venue.country),
-      timezone: firstDefined(venue.timezone),
-      latitude: firstDefined(venue.latitude),
-      longitude: firstDefined(venue.longitude),
     },
   };
 }
@@ -768,57 +707,6 @@ function extractWinProbability(wp) {
     team1: { name: nf(team1.name), shortName: nf(team1.shortName), percent: team1.percent ?? NF },
     team2: { name: nf(team2.name), shortName: nf(team2.shortName), percent: team2.percent ?? NF },
     drawPercent: wp.drawTiePercent ?? NF,
-  };
-}
-
-// ---------------------------------------------------------------------
-// Commentary highlights: four / six / wicket / dot balls
-// ---------------------------------------------------------------------
-function stripHtmlTags(str) {
-  return String(str || "").replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
-}
-
-// A ball only counts if it has a real over.ball value (bowler-change /
-// over-break announcement rows don't). "dot" = a real delivery whose event
-// tags don't include any run/wicket/extra keyword (over-break rows often
-// drop the plain "none" tag but still carry no scoring tag, so this still
-// catches them).
-function classifyCommentaryEvent(entry) {
-  if (typeof entry.ballMetric !== "number") return null;
-  const events = Array.isArray(entry.event) ? entry.event.map((e) => String(e).toLowerCase()) : [];
-  if (events.includes("wicket")) return "wicket";
-  if (events.includes("six")) return "six";
-  if (events.includes("four")) return "four";
-  const hasRunEvent = RUN_EVENT_WORDS.some((w) => events.includes(w));
-  return hasRunEvent ? null : "dot";
-}
-
-function extractCommentaryHighlights(commData, maxPerType) {
-  maxPerType = maxPerType || 8;
-  if (!commData || typeof commData !== "object") return null;
-
-  const entries = Object.values(commData)
-    .filter((e) => e && typeof e === "object" && e.commType === "commentary")
-    .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-
-  const buckets = { four: [], six: [], wicket: [], dot: [] };
-  for (const entry of entries) {
-    const type = classifyCommentaryEvent(entry);
-    if (!type || buckets[type].length >= maxPerType) continue;
-    buckets[type].push({
-      over: entry.ballMetric !== undefined ? String(entry.ballMetric) : NF,
-      text: nf(stripHtmlTags(entry.commText)),
-      batsman: nf(entry.batsmanDetails && entry.batsmanDetails.playerName),
-      bowler: nf(entry.bowlerDetails && entry.bowlerDetails.playerName),
-      team: nf(entry.teamName),
-    });
-  }
-
-  return {
-    four: buckets.four.length ? buckets.four : NF,
-    six: buckets.six.length ? buckets.six : NF,
-    wicket: buckets.wicket.length ? buckets.wicket : NF,
-    dot: buckets.dot.length ? buckets.dot : NF,
   };
 }
 
