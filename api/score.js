@@ -8,34 +8,36 @@ const MATCH_URL = "https://www.cricbuzz.com/live-cricket-scores/154410/jkm-vs-sn
 // ================================================================
 //
 // MEKA UPDATE EKA - monawada wenas kalේ:
-// 1) Squad eka dan Players / Bench / Support Staff kiyala vena vena
-//    array 3kට bedila therenna, screenshot eke tibba pilivelatama.
-// 2) Field ekak hambune nathnam "not found" nathuwa "-" (NF constant)
-//    output karanawa - text eka podi karanna.
-// 3) Marker scan karana logic eka wenas kala - kalin thibba widiyata
-//    marker ekak ekak wenama chunk okkoma scan kaloth (markers gana x
-//    chunks gana) godak wada wenawa, eka thamai Vercel Fluid Active
-//    CPU eka 12s vage wadi wenna hේthuwa una ganan gannawa. Dan chunk
-//    ekakata ekapaharatama markers okkoma check karana single regex
-//    pass ekak, hit una chunk walata witharai vistharatma balanne.
-//    Meken scanning cost eka godak adui.
-//
-// Bench / Support Staff walata Cricbuzz eke thiyena real JSON field
-// name eka mata confirm karaganna beri nisa (network eken test karanna
-// beri nisa), keys godayak try karanawa (BENCH_LIST_KEYS / STAFF_LIST_KEYS).
-// Eka empty ("-") wenawa nam, squads page eke ?debug=1&scan=1 danna,
-// eyata real key eka penei - eka mata kiwwoth list eka update karannam.
+// 1) Squad eken dan gannne Team Name + Players list witharai. Bench /
+//    Support Staff ain karala (epa kiwwa nisa).
+// 2) Players array eka hoyaddi, kalin widiyata exact key name (players,
+//    squad, playing11 wage) witharak try kaloth eka key eka wena
+//    (cricbuzz eke real field name eka) nam empty ("-") wenawa. Eka
+//    nisa dan: 1st - known key names try karanawa, eka fail una nam,
+//    2nd - team object eke thiyena array *okkoma* balala, name/playerName
+//    thiyena object tika (nathnam string tika) thiyena eken loku ම
+//    array eka players list widiyata gannawa (fallback - key name
+//    kohomath una players array eka hoyaganna puluwan wenna ඕන).
+// 3) `?debug=1` දැම්මම squads_extraction_debug කියලා section එකක්
+//    දෙනවා - team object eke real keys මොනවද, players list එක ගත්තේ
+//    කුමන key එකෙන්ද, කීයක් හම්බුනාද කියලා. Players tika thawath "-"
+//    nam, eka debug output eka mata evanna - eyin real key eka penei,
+//    eka PLAYER_LIST_KEYS walata add karannam.
+// 4) Field ekak hambune nathnam "not found" nathuwa "-" (NF constant)
+//    output karanawa.
+// 5) Marker scan karana logic eka - marker ekak ekak wenama chunk
+//    okkoma scan karanawa wenuwata, chunk ekakata ekapaharatama
+//    markers okkoma check karana single regex pass ekak, hit una
+//    chunk walata witharai vistharatma balanne (Active CPU adu karanna).
 
 const SCORECARD_MARKER = "scorecardApiData";
 const LIVE_MARKER_CANDIDATES = ["miniscore", "matchScoreDetails", "liveApiData", "commentaryApiData", "faceoffApiData"];
 const RECENT_KEY_CANDIDATES = ["recentOvsStats", "recentOvers", "recentBalls", "recentScores", "recent"];
 const SQUAD_MARKER_CANDIDATES = ["matchSquadsData", "squadsApiData", "squadData", "matchSquadData", "teamSquadData"];
 
-// squad eke Players / Bench / Support Staff kiyana kotasa hoyaddi try
-// karana field-name variants (best-effort, exact key confirm na)
+// squad eke Players list eka hoyaddi try karana field-name variants
+// (mona key eken una nathath, fallback ekakuth code eke thiyenawa)
 const PLAYER_LIST_KEYS = ["players", "playerList", "squad", "playing11", "playingXI", "playersList"];
-const BENCH_LIST_KEYS = ["bench", "benchPlayers", "benchList", "reserves", "reservePlayers", "substitutes"];
-const STAFF_LIST_KEYS = ["supportStaff", "staff", "management", "teamManagement", "supportStaffList"];
 
 const MAX_HTML_BYTES = 6 * 1024 * 1024;
 const MAX_CHUNKS = 400;
@@ -126,10 +128,6 @@ module.exports = async function handler(req, res) {
     }
 
     // ---- single-pass marker index eka hadanawa (CPU optimization) ----
-    // Kalin widiyata marker ekak ekak wenama chunk okkoma scan kaloth
-    // (markers gana x chunks gana) indexOf call godak yanawa. Dan chunk
-    // ekakata ekapaharatama markers okkoma check karana regex ekak
-    // witharai, hit una eken witharak thavath vistharayak balanne.
     const scorecardNeededMarkers = [SCORECARD_MARKER, ...LIVE_MARKER_CANDIDATES, ...RECENT_KEY_CANDIDATES, ...SQUAD_MARKER_CANDIDATES];
     const scorecardMarkerIndex = buildChunkMarkerIndex(scorecardRaw, scorecardNeededMarkers);
 
@@ -220,7 +218,7 @@ module.exports = async function handler(req, res) {
     // already have from the scorecard page's scorecardApiData blob.
     const matchInfo = extractMatchInfo(data.matchHeader || {});
 
-    // Squads (both teams' Players / Bench / Support Staff) — separate page, best-effort.
+    // Squads (both teams' Team Name + Players) — separate page, best-effort.
     let squadMarkerUsed = null;
     let squadsRawData = null;
     for (const marker of SQUAD_MARKER_CANDIDATES) {
@@ -228,7 +226,7 @@ module.exports = async function handler(req, res) {
       if (!d) d = findMarkerLazy(scorecardRaw, scorecardCache, marker, scorecardMarkerIndex.get(marker));
       if (d) { squadsRawData = d; squadMarkerUsed = marker; break; }
     }
-    const squads = extractSquads(squadsRawData);
+    const { squads, debugInfo: squadsDebug } = extractSquads(squadsRawData);
 
     const result = {
       status: "success",
@@ -252,6 +250,7 @@ module.exports = async function handler(req, res) {
         live_blob_marker_used: liveBlob ? liveBlob.marker : null,
         squad_marker_used: squadMarkerUsed,
         squads_raw_top_level_keys: squadsRawData ? Object.keys(squadsRawData) : null,
+        squads_extraction_debug: squadsDebug,
         current_scorecard_top_level_keys: Object.keys(current),
         batsmen_extraction_debug: batDebug,
         recent_ticker_debug: recentHit || { note: "not found — try &debug=1&scan=1" },
@@ -302,24 +301,41 @@ function extractPlayerNames(list) {
     .filter(Boolean);
 }
 
-// key candidate list ekaka first non-empty array eka team object eken
-// hoyaganna
-function pickFirstArray(obj, keys) {
-  for (const k of keys) {
-    if (obj && Array.isArray(obj[k]) && obj[k].length > 0) return obj[k];
+// 1st: known key names try karanawa (PLAYER_LIST_KEYS).
+// Eka fail una nam: team object eke thiyena array *okkoma* balala,
+// name/playerName/fullName/id thiyena object tika (nathnam plain
+// string tika) witharak thiyena array tika athara loku ම eka gannawa
+// (players list eka usually team object eke loku ma array eka wenna ඕන).
+function findPlayersArrayWithSource(teamObj) {
+  for (const key of PLAYER_LIST_KEYS) {
+    if (Array.isArray(teamObj[key]) && teamObj[key].length > 0) {
+      return { list: teamObj[key], sourceKey: key };
+    }
   }
-  return [];
+
+  let bestKey = null;
+  let best = [];
+  for (const key of Object.keys(teamObj)) {
+    const val = teamObj[key];
+    if (!Array.isArray(val) || val.length === 0) continue;
+    const looksLikePlayers = val.every(
+      (p) => typeof p === "string" || (p && typeof p === "object" && (p.name || p.playerName || p.fullName || p.id))
+    );
+    if (looksLikePlayers && val.length > best.length) { best = val; bestKey = key; }
+  }
+  return { list: best, sourceKey: bestKey ? `fallback:${bestKey}` : null };
 }
 
-// Pulls each team's Players / Bench / Support Staff lists out of the
-// squads blob, keeping the 3 sections separate (screenshot eke tibba
-// pilivelatama). Exact key names unconfirmed (see SQUAD_MARKER_CANDIDATES,
-// PLAYER_LIST_KEYS, BENCH_LIST_KEYS, STAFF_LIST_KEYS / &debug=1&scan=1 on
-// the squads page if a section keeps coming back empty).
+// Pulls each team's Name + Players out of the squads blob. Returns both
+// the parsed squads AND a debugInfo object (team object keys, which key
+// the players list was picked from, how many players found) so that if
+// this ever comes back empty, `?debug=1` shows exactly why without
+// needing &scan=1.
 function extractSquads(squadData) {
-  const emptyTeam = () => ({ name: NF, players: [], bench: [], supportStaff: [] });
+  const emptyTeam = () => ({ name: NF, players: [] });
   const empty = { team1: emptyTeam(), team2: emptyTeam() };
-  if (!squadData || typeof squadData !== "object") return empty;
+  const debugInfo = { team_containers_found: 0, teams: [] };
+  if (!squadData || typeof squadData !== "object") return { squads: empty, debugInfo };
 
   const teamContainers = [];
   for (const key of ["team1", "team2", "squad1", "squad2"]) {
@@ -331,18 +347,23 @@ function extractSquads(squadData) {
   if (teamContainers.length === 0 && Array.isArray(squadData)) {
     teamContainers.push(...squadData);
   }
-  if (teamContainers.length === 0) return empty;
+  debugInfo.team_containers_found = teamContainers.length;
+  if (teamContainers.length === 0) return { squads: empty, debugInfo };
 
   const parsed = teamContainers.slice(0, 2).map((teamObj) => {
     const name = teamObj.teamName || teamObj.name || teamObj.shortName || NF;
-    const players = extractPlayerNames(pickFirstArray(teamObj, PLAYER_LIST_KEYS));
-    const bench = extractPlayerNames(pickFirstArray(teamObj, BENCH_LIST_KEYS));
-    const supportStaff = extractPlayerNames(pickFirstArray(teamObj, STAFF_LIST_KEYS));
-    return { name, players, bench, supportStaff };
+    const { list, sourceKey } = findPlayersArrayWithSource(teamObj);
+    debugInfo.teams.push({
+      name,
+      team_object_keys: Object.keys(teamObj),
+      players_source_key: sourceKey,
+      players_count: list.length,
+    });
+    return { name, players: extractPlayerNames(list) };
   });
 
   while (parsed.length < 2) parsed.push(emptyTeam());
-  return { team1: parsed[0], team2: parsed[1] };
+  return { squads: { team1: parsed[0], team2: parsed[1] }, debugInfo };
 }
 
 function extractBatsmen(current) {
@@ -400,12 +421,6 @@ function escapeRegex(s) {
 }
 
 // ---- CPU optimization: single-pass multi-marker scan ----
-// Kalin: marker ekak ekak wenama, chunk okkoma scan karanawa (rawChunkMayContain
-// eken) - eka nisa markers 15ක් vage thiyena eka, chunk 400ක් thiyena
-// pages walata, indexOf call 6000ට wada yanawa full-length strings mata.
-// Dan: chunk ekakata combined regex ekakin ekapaharatama markers okkoma
-// check karanawa (single scan). Hit una chunk walata witharai thavath
-// vistharayak balanne (chunk ganan kuranu labai nisa eka lassanai).
 function buildChunkMarkerIndex(rawChunks, markers) {
   const uniqueMarkers = Array.from(new Set(markers));
   const index = new Map(uniqueMarkers.map((m) => [m, []]));
@@ -436,9 +451,6 @@ function decodeChunk(rawChunks, idx, cache) {
   return decoded;
 }
 
-// candidateIndices ekak dunnoth (buildChunkMarkerIndex eken awapu eka)
-// eth witharai loop karanne — dunne naththan (backward-compat) chunk
-// okkoma loop karanawa kalin widiyatama.
 function findMarkerLazy(rawChunks, cache, marker, candidateIndices) {
   const indices = candidateIndices || rawChunks.map((_, i) => i);
   for (const i of indices) {
