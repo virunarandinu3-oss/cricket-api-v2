@@ -20,7 +20,7 @@
 // එකට වඩා ප්‍රමුඛතාවය ගන්නවා — ඒත් daily use එකට ඕන වෙන්නේ මේ constant එකේ
 // link එක update කරන එක විතරයි.
 // ==========================================================================
-const DEFAULT_MATCH_LINK = "https://www.cricbuzz.com/live-cricket-scores/163013/";
+const DEFAULT_MATCH_LINK = "https://www.cricbuzz.com/live-cricket-scores/154410/jkm-vs-snp-10th-match-caribbean-premier-league-2026";
 
 // Pulls the numeric match id out of ANY Cricbuzz match URL — works for
 // both /live-cricket-scores/<id>/... and /live-cricket-scorecard/<id>/...
