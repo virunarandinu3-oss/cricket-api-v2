@@ -8,6 +8,14 @@ const PLAYER_LIST_KEYS = ["players", "playerList", "squad", "playing11", "playin
 const NEWS_PATH_PREFIX = "/cricket-news";
 const GALLERY_PATH_PREFIX = "/cricket-gallery";
 
+// Commentary feed + win probability markers, and the vocabulary used to
+// classify each ball (four / six / wicket / dot) from its "event" tags.
+const COMMENTARY_MARKER = "matchCommentary";
+const WIN_PROBABILITY_MARKER = "winProbability";
+const EXTRA_LIVE_MARKERS = [COMMENTARY_MARKER, WIN_PROBABILITY_MARKER];
+const RUN_EVENT_WORDS = ["one", "two", "three", "four", "five", "six", "wicket", "wide", "noball", "no-ball", "no_ball", "bye", "legbye", "leg-bye", "leg_bye", "penalty"];
+const COMMENTARY_EVENT_LIMIT = 8;
+
 const MAX_HTML_BYTES = 6 * 1024 * 1024;
 const MAX_CHUNKS = 400;
 const CACHE_TTL_MS = 15000;
@@ -89,7 +97,7 @@ module.exports = async function handler(req, res) {
 
     const scorecardNeededMarkers = [SCORECARD_MARKER, ...LIVE_MARKER_CANDIDATES, ...RECENT_KEY_CANDIDATES];
     const scorecardMarkerIndex = buildChunkMarkerIndex(scorecardRaw, scorecardNeededMarkers);
-    const liveNeededMarkers = [...LIVE_MARKER_CANDIDATES, ...RECENT_KEY_CANDIDATES];
+    const liveNeededMarkers = [...LIVE_MARKER_CANDIDATES, ...RECENT_KEY_CANDIDATES, ...EXTRA_LIVE_MARKERS];
     const liveMarkerIndex = liveRaw.length ? buildChunkMarkerIndex(liveRaw, liveNeededMarkers) : new Map();
     const squadsMarkerIndex = squadsRaw.length ? buildChunkMarkerIndex(squadsRaw, SQUAD_TEAM_KEYS) : new Map();
 
@@ -204,9 +212,6 @@ module.exports = async function handler(req, res) {
         dayNight: extended.meta.dayNight === undefined ? NF : extended.meta.dayNight,
         state: nf(extended.meta.state),
         shortStatus: nf(extended.meta.shortStatus),
-        livestreamEnabled: extended.meta.livestreamEnabled === undefined ? NF : extended.meta.livestreamEnabled,
-        livestreamEnabledGeo: Array.isArray(extended.meta.livestreamEnabledGeo) ? extended.meta.livestreamEnabledGeo : NF,
-        isFantasyEnabled: extended.meta.isFantasyEnabled === undefined ? NF : extended.meta.isFantasyEnabled,
       };
 
       result.officials = {
@@ -230,6 +235,22 @@ module.exports = async function handler(req, res) {
         latitude: nf(extended.venueDetails.latitude),
         longitude: nf(extended.venueDetails.longitude),
       };
+
+      // Key Stats: partnership, last wicket, overs left, last 10 overs, toss
+      result.keyStats = extractKeyStats(liveBlob ? liveBlob.data : null, data.matchHeader || {});
+
+      // Win probability (e.g. SL 5% / IND 94% / Draw 1%)
+      const winProb = extractWinProbability(
+        findMarkerLazy(liveRaw, liveCache, WIN_PROBABILITY_MARKER, liveMarkerIndex.get(WIN_PROBABILITY_MARKER)) ||
+          findMarkerLazy(scorecardRaw, scorecardCache, WIN_PROBABILITY_MARKER, scorecardMarkerIndex.get(WIN_PROBABILITY_MARKER))
+      );
+      result.winProbability = winProb || NF;
+
+      // Ball-by-ball highlights split into four / six / wicket / dot
+      const commentaryData =
+        findMarkerLazy(liveRaw, liveCache, COMMENTARY_MARKER, liveMarkerIndex.get(COMMENTARY_MARKER)) ||
+        findMarkerLazy(scorecardRaw, scorecardCache, COMMENTARY_MARKER, scorecardMarkerIndex.get(COMMENTARY_MARKER));
+      result.commentary = extractCommentaryHighlights(commentaryData, COMMENTARY_EVENT_LIMIT) || NF;
 
       const ldLive = extractJsonLdSidebars(liveHtml);
       const ldScorecard = extractJsonLdSidebars(html);
@@ -298,6 +319,9 @@ module.exports = async function handler(req, res) {
       if (!result.officials) result.officials = NF;
       if (!result.series) result.series = NF;
       if (!result.venueDetails) result.venueDetails = NF;
+      if (!result.keyStats) result.keyStats = NF;
+      if (!result.winProbability) result.winProbability = NF;
+      if (!result.commentary) result.commentary = NF;
       if (!result.media) result.media = NF;
     }
 
@@ -676,9 +700,6 @@ function extractExtendedMatchInfo(matchHeader, matchInfoBlob) {
       dayNight: firstDefined(mh.dayNight, mi.dayNight),
       state: firstDefined(mh.state, mi.state),
       shortStatus: firstDefined(mi.shortStatus, mh.shortStatus),
-      livestreamEnabled: firstDefined(mh.livestreamEnabled, mi.livestreamEnabled),
-      livestreamEnabledGeo: firstDefined(mi.livestreamEnabledGeo, mh.livestreamEnabledGeo),
-      isFantasyEnabled: firstDefined(mi.isFantasyEnabled, mh.isFantasyEnabled),
     },
     officials: {
       umpire1: formatPersonInfo(mi.umpire1 || mh.umpire1),
@@ -699,6 +720,105 @@ function extractExtendedMatchInfo(matchHeader, matchInfoBlob) {
       latitude: firstDefined(venue.latitude),
       longitude: firstDefined(venue.longitude),
     },
+  };
+}
+
+// ---------------------------------------------------------------------
+// Key Stats: partnership, last wicket, overs left, last 10 overs, toss
+// ---------------------------------------------------------------------
+function extractKeyStats(miniscoreData, matchHeader) {
+  const md = miniscoreData || {};
+
+  let partnership;
+  if (md.partnerShip && typeof md.partnerShip === "object") {
+    partnership = `${md.partnerShip.runs ?? 0}(${md.partnerShip.balls ?? 0})`;
+  }
+
+  let last10Overs;
+  if (Array.isArray(md.latestPerformance)) {
+    const entry = md.latestPerformance.find(
+      (p) => p && typeof p.label === "string" && p.label.toLowerCase().includes("last 10")
+    );
+    if (entry) last10Overs = `${entry.runs ?? 0} runs, ${entry.wkts ?? 0} wkts`;
+  }
+
+  let toss;
+  if (matchHeader && matchHeader.tossResults) {
+    const t = matchHeader.tossResults;
+    toss = `${t.tossWinnerName || NF} (${t.decision || NF})`;
+  }
+
+  return {
+    partnership: nf(partnership),
+    lastWicket: nf(typeof md.lastWicket === "string" ? md.lastWicket.replace(/\s+/g, " ").trim() : undefined),
+    oversLeft: nf(md.oversRem !== undefined ? String(md.oversRem) : undefined),
+    last10Overs: nf(last10Overs),
+    toss: nf(toss),
+  };
+}
+
+// ---------------------------------------------------------------------
+// Win probability (e.g. SL 5% vs IND 94%, draw/tie 1%)
+// ---------------------------------------------------------------------
+function extractWinProbability(wp) {
+  if (!wp || typeof wp !== "object") return null;
+  const team1 = wp.team1 || {};
+  const team2 = wp.team2 || {};
+  return {
+    team1: { name: nf(team1.name), shortName: nf(team1.shortName), percent: team1.percent ?? NF },
+    team2: { name: nf(team2.name), shortName: nf(team2.shortName), percent: team2.percent ?? NF },
+    drawPercent: wp.drawTiePercent ?? NF,
+  };
+}
+
+// ---------------------------------------------------------------------
+// Commentary highlights: four / six / wicket / dot balls
+// ---------------------------------------------------------------------
+function stripHtmlTags(str) {
+  return String(str || "").replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
+}
+
+// A ball only counts if it has a real over.ball value (bowler-change /
+// over-break announcement rows don't). "dot" = a real delivery whose event
+// tags don't include any run/wicket/extra keyword (over-break rows often
+// drop the plain "none" tag but still carry no scoring tag, so this still
+// catches them).
+function classifyCommentaryEvent(entry) {
+  if (typeof entry.ballMetric !== "number") return null;
+  const events = Array.isArray(entry.event) ? entry.event.map((e) => String(e).toLowerCase()) : [];
+  if (events.includes("wicket")) return "wicket";
+  if (events.includes("six")) return "six";
+  if (events.includes("four")) return "four";
+  const hasRunEvent = RUN_EVENT_WORDS.some((w) => events.includes(w));
+  return hasRunEvent ? null : "dot";
+}
+
+function extractCommentaryHighlights(commData, maxPerType) {
+  maxPerType = maxPerType || 8;
+  if (!commData || typeof commData !== "object") return null;
+
+  const entries = Object.values(commData)
+    .filter((e) => e && typeof e === "object" && e.commType === "commentary")
+    .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+  const buckets = { four: [], six: [], wicket: [], dot: [] };
+  for (const entry of entries) {
+    const type = classifyCommentaryEvent(entry);
+    if (!type || buckets[type].length >= maxPerType) continue;
+    buckets[type].push({
+      over: entry.ballMetric !== undefined ? String(entry.ballMetric) : NF,
+      text: nf(stripHtmlTags(entry.commText)),
+      batsman: nf(entry.batsmanDetails && entry.batsmanDetails.playerName),
+      bowler: nf(entry.bowlerDetails && entry.bowlerDetails.playerName),
+      team: nf(entry.teamName),
+    });
+  }
+
+  return {
+    four: buckets.four.length ? buckets.four : NF,
+    six: buckets.six.length ? buckets.six : NF,
+    wicket: buckets.wicket.length ? buckets.wicket : NF,
+    dot: buckets.dot.length ? buckets.dot : NF,
   };
 }
 
