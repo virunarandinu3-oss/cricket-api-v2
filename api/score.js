@@ -17,7 +17,7 @@
 // ================================================================
 //                  MATCH LINK EKA METHANATA DANNA
 // ================================================================
-const MATCH_URL = "https://www.cricbuzz.com/cricket-match-squads/163013/sl-vs-ind-1st-test-india-tour-of-sri-lanka-2026";
+const MATCH_URL = "https://www.cricbuzz.com/live-cricket-scores/163013/sl-vs-ind-1st-test-india-tour-of-sri-lanka-2026";
 // ================================================================
 // ================================================================
 
