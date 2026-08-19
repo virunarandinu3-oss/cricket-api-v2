@@ -1,4 +1,6 @@
-const MATCH_URL = "https://www.cricbuzz.com/live-cricket-scores/163013/sl-vs-ind-1st-test-india-tour-of-sri-lanka-2026";
+const MATCH_URL =
+  process.env.MATCH_URL ||
+  "https://www.cricbuzz.com/live-cricket-scores/163013/sl-vs-ind-1st-test-india-tour-of-sri-lanka-2026";
 
 const SCORECARD_MARKER = "scorecardApiData";
 const LIVE_MARKER_CANDIDATES = ["miniscore", "matchScoreDetails", "liveApiData", "commentaryApiData", "faceoffApiData"];
@@ -18,9 +20,18 @@ const MAX_HTML_BYTES = 6 * 1024 * 1024;
 const MAX_CHUNKS = 400;
 const CACHE_TTL_MS = 15000;
 
+// How long a single upstream (Cricbuzz) request is allowed to hang before
+// it's aborted. Keeps one slow request from burning the whole Vercel
+// function-duration budget (Hobby plan caps this at 10s).
+const FETCH_TIMEOUT_MS = 8000;
+
 const NF = "-";
 
+// In-memory cache (survives only while the serverless instance stays warm).
 let CACHE = { data: null, expires: 0 };
+// De-dupes concurrent requests that land while a fetch is already running,
+// so a burst of hits never turns into a burst of Cricbuzz requests.
+let INFLIGHT = null;
 
 function extractMatchIdFromLink(link) {
   const m = String(link).match(/cricbuzz\.com\/live-cricket-(?:scores|scorecard)\/(\d{4,20})\//);
@@ -37,18 +48,51 @@ function nf(value) {
   return value;
 }
 
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 module.exports = async function handler(req, res) {
   res.setHeader("access-control-allow-origin", "*");
-  res.setHeader("cache-control", "no-store");
+  // Let Vercel's edge network serve repeat hits straight from cache instead
+  // of re-invoking this function (and re-hitting Cricbuzz) every time —
+  // this is the main lever for staying inside the Hobby plan's invocation
+  // budget and keeping Cricbuzz request volume (and IP-block risk) low even
+  // under continuous polling.
+  res.setHeader("cache-control", `public, s-maxage=${Math.floor(CACHE_TTL_MS / 1000)}, stale-while-revalidate=60`);
   res.setHeader("content-type", "application/json;charset=UTF-8");
 
   if (CACHE.data && Date.now() < CACHE.expires) {
     return res.status(200).send(JSON.stringify(CACHE.data, null, 2));
   }
 
+  try {
+    if (!INFLIGHT) {
+      INFLIGHT = buildResult().finally(() => {
+        INFLIGHT = null;
+      });
+    }
+    const outcome = await INFLIGHT;
+    if (outcome.error) {
+      return res.status(outcome.status).send(JSON.stringify(outcome.body));
+    }
+    CACHE = { data: outcome.body, expires: Date.now() + CACHE_TTL_MS };
+    return res.status(200).send(JSON.stringify(outcome.body, null, 2));
+  } catch (e) {
+    return res.status(500).send(JSON.stringify({ status: "error", message: String(e) }));
+  }
+};
+
+async function buildResult() {
   const matchId = extractMatchIdFromLink(MATCH_URL);
   if (!matchId) {
-    return res.status(422).send(JSON.stringify({ status: "error", message: "invalid MATCH_URL" }));
+    return { error: true, status: 422, body: { status: "error", message: "invalid MATCH_URL" } };
   }
 
   const cacheBuster = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -67,20 +111,20 @@ module.exports = async function handler(req, res) {
 
   try {
     const [scorecardRes, liveRes, squadsRes] = await Promise.all([
-      fetch(scorecardUrl, { headers }),
-      fetch(liveScoresUrl, { headers }).catch(() => null),
-      fetch(squadsUrl, { headers }).catch(() => null),
+      fetchWithTimeout(scorecardUrl, { headers }, FETCH_TIMEOUT_MS),
+      fetchWithTimeout(liveScoresUrl, { headers }, FETCH_TIMEOUT_MS).catch(() => null),
+      fetchWithTimeout(squadsUrl, { headers }, FETCH_TIMEOUT_MS).catch(() => null),
     ]);
 
     if (!scorecardRes.ok) {
-      return res.status(502).send(JSON.stringify({ status: "error", message: "cricbuzz fetch failed: " + scorecardRes.status }));
+      return { error: true, status: 502, body: { status: "error", message: "cricbuzz fetch failed: " + scorecardRes.status } };
     }
     const html = await scorecardRes.text();
     const liveHtml = liveRes && liveRes.ok ? await liveRes.text() : "";
     const squadsHtml = squadsRes && squadsRes.ok ? await squadsRes.text() : "";
 
     if (html.length > MAX_HTML_BYTES || liveHtml.length > MAX_HTML_BYTES || squadsHtml.length > MAX_HTML_BYTES) {
-      return res.status(502).send(JSON.stringify({ status: "error", message: "page too large to process safely" }));
+      return { error: true, status: 502, body: { status: "error", message: "page too large to process safely" } };
     }
 
     let scorecardRaw = splitRawChunks(html);
@@ -101,12 +145,12 @@ module.exports = async function handler(req, res) {
 
     const data = findMarkerLazy(scorecardRaw, scorecardCache, SCORECARD_MARKER, scorecardMarkerIndex.get(SCORECARD_MARKER));
     if (!data) {
-      return res.status(502).send(JSON.stringify({ status: "error", message: "could not find scorecardApiData" }));
+      return { error: true, status: 502, body: { status: "error", message: "could not find scorecardApiData" } };
     }
 
     const scoreCards = data.scoreCard || [];
     if (scoreCards.length === 0) {
-      return res.status(502).send(JSON.stringify({ status: "error", message: "no innings data yet" }));
+      return { error: true, status: 502, body: { status: "error", message: "no innings data yet" } };
     }
 
     const current = scoreCards[scoreCards.length - 1];
@@ -246,12 +290,11 @@ module.exports = async function handler(req, res) {
       if (!result.commentary) result.commentary = NF;
     }
 
-    CACHE = { data: result, expires: Date.now() + CACHE_TTL_MS };
-    return res.status(200).send(JSON.stringify(result, null, 2));
+    return { error: false, body: result };
   } catch (e) {
-    return res.status(500).send(JSON.stringify({ status: "error", message: String(e) }));
+    return { error: true, status: 500, body: { status: "error", message: String(e) } };
   }
-};
+}
 
 function extractMatchInfo(matchHeader) {
   const team1Name = (matchHeader.team1 && (matchHeader.team1.shortName || matchHeader.team1.name)) || "";
