@@ -1,75 +1,26 @@
-// Cricbuzz eke match eke link eka methanata danna:
-// ================================================================
-// ================================================================
-//                  MATCH LINK EKA METHANATA DANNA
-// ================================================================
 const MATCH_URL = "https://www.cricbuzz.com/live-cricket-scores/163013/sl-vs-ind-1st-test-india-tour-of-sri-lanka-2026";
-// ================================================================
-// ================================================================
-//
-// MEKA UPDATE EKA (v4) - monawada wenas kalේ:
-// Squads part eka mulinma FULL script ekata apsu ekathu kala (score,
-// toss, venue, batsmen, bowler, recent, okkoma UNCHANGED widiyata
-// wada karanawa - eka mulinma thibba widiyatama). Squads eka witharak
-// wenas kala:
-// 1) User dunna raw HTML eken squads page eke REAL structure eka
-//    confirm kala - `{"team1":{"team":{teamId,teamName,...},
-//    "players":{"playing XI":[...],"bench":[...]}}, "team2":{...}}`.
-//    Eka nisa "team1":{"team": kiyana fingerprint eken kelinma object
-//    eka locate karagannawa (findSquadsObjectDirect) - guess/scan
-//    ekak karanna one na.
-// 2) Bench eka saha support staff (thiyenawa nam) EXCLUDE karala,
-//    "playing XI" (or "playing"/"11"/"XI" wage keyword ekak thiyena
-//    key eka) witharak players list ekata gannawa.
-// 3) Player list eka nam witharak (string array ekak) - object/extra
-//    fields danne na.
-// 4) Direct-parse eka fail una nam (page format wenas una nam)
-//    pahala fuzzy candidate-scanning eka backup widiyata thiyenawa.
-// 5) `?debug=1` daalama squads_extraction_debug.method eke "direct-parse"
-//    nathnam "fuzzy-fallback" kiyala penei.
-//
-// MEKA UPDATE EKA (v5) - alut features - PURANA DEYAK WENAS KALE NA,
-// AWULAK ETHTHOTH NAWATHA add witharak kala:
-// 6) Match Officials / Series info: umpire1/2/3, referee, series
-//    result (e.g "Series levelled 0-0"), series start/end date.
-// 7) Venue geo details: city, country, timezone, latitude, longitude.
-// 8) Match Meta: matchFormat, dayNumber, dayNight, state, shortStatus,
-//    livestreamEnabled + livestreamEnabledGeo list, isFantasyEnabled.
-// 9) Media: highlight videos + press-conference videos (venama tag
-//    karala), latest news (title+link), latest photo gallery
-//    (title+link+date). Source eka: live-scores page eke JS chunk
-//    ekaka thiyena "matchInfo"/"videoList"/"matchVideos" blobs, saha
-//    SSR html ekema literal widiyata thiyena JSON-LD <script> tags.
-//    Field ekak hamba unne nathnam "-" (NF) - "not found" text ekak
-//    kisi welawaka danne na. Meka okkoma try/catch ekakin wrap karala
-//    thiyenne - meka fail una athata pawa purana result eka (score,
-//    batsmen, squads, etc) EKA WELAWAKATWATA break wenne na.
 
 const SCORECARD_MARKER = "scorecardApiData";
 const LIVE_MARKER_CANDIDATES = ["miniscore", "matchScoreDetails", "liveApiData", "commentaryApiData", "faceoffApiData"];
 const RECENT_KEY_CANDIDATES = ["recentOvsStats", "recentOvers", "recentBalls", "recentScores", "recent"];
 const SQUAD_TEAM_KEYS = ["team1", "team2"];
-
-// squad eke Players list eka hoyaddi try karana field-name variants
-// (fuzzy fallback ekata witharak - primary direct-parse eka meka
-// use karanne na)
 const PLAYER_LIST_KEYS = ["players", "playerList", "squad", "playing11", "playingXI", "playersList"];
+const NEWS_PATH_PREFIX = "/cricket-news";
+const GALLERY_PATH_PREFIX = "/cricket-gallery";
 
 const MAX_HTML_BYTES = 6 * 1024 * 1024;
 const MAX_CHUNKS = 400;
+const CACHE_TTL_MS = 15000;
 
-const NF = "-"; // "not found" wenuwata methanin danna thani akura
+const NF = "-";
 
-// ---- NEW (v5) consts: news/photo link scanning ----
-const NEWS_PATH_PREFIX = "/cricket-news";
-const GALLERY_PATH_PREFIX = "/cricket-gallery";
+let CACHE = { data: null, expires: 0 };
 
 function extractMatchIdFromLink(link) {
   const m = String(link).match(/cricbuzz\.com\/live-cricket-(?:scores|scorecard)\/(\d{4,20})\//);
   return m ? m[1] : null;
 }
 
-// value ekak nathnam / empty string nam / "not found" nam - "-" denawa
 function nf(value) {
   if (value === null || value === undefined) return NF;
   if (typeof value === "string") {
@@ -81,15 +32,17 @@ function nf(value) {
 }
 
 module.exports = async function handler(req, res) {
-  const debug = req.query.debug === "1";
-  const scan = req.query.scan === "1";
-
   res.setHeader("access-control-allow-origin", "*");
   res.setHeader("cache-control", "no-store");
+  res.setHeader("content-type", "application/json;charset=UTF-8");
+
+  if (CACHE.data && Date.now() < CACHE.expires) {
+    return res.status(200).send(JSON.stringify(CACHE.data, null, 2));
+  }
 
   const matchId = extractMatchIdFromLink(MATCH_URL);
   if (!matchId) {
-    return res.status(422).json({ status: "error", message: "invalid MATCH_URL at top of file" });
+    return res.status(422).send(JSON.stringify({ status: "error", message: "invalid MATCH_URL" }));
   }
 
   const cacheBuster = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -98,16 +51,13 @@ module.exports = async function handler(req, res) {
   const squadsUrl = `https://www.cricbuzz.com/cricket-match-squads/${matchId}?_cb=${cacheBuster}`;
 
   const headers = {
-    "User-Agent":
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     Referer: "https://www.cricbuzz.com/",
     Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Cache-Control": "no-cache, no-store, must-revalidate",
     Pragma: "no-cache",
   };
-
-  const t0 = Date.now();
 
   try {
     const [scorecardRes, liveRes, squadsRes] = await Promise.all([
@@ -117,14 +67,14 @@ module.exports = async function handler(req, res) {
     ]);
 
     if (!scorecardRes.ok) {
-      return res.status(502).json({ status: "error", message: "cricbuzz fetch failed: " + scorecardRes.status });
+      return res.status(502).send(JSON.stringify({ status: "error", message: "cricbuzz fetch failed: " + scorecardRes.status }));
     }
     const html = await scorecardRes.text();
     const liveHtml = liveRes && liveRes.ok ? await liveRes.text() : "";
     const squadsHtml = squadsRes && squadsRes.ok ? await squadsRes.text() : "";
 
     if (html.length > MAX_HTML_BYTES || liveHtml.length > MAX_HTML_BYTES || squadsHtml.length > MAX_HTML_BYTES) {
-      return res.status(502).json({ status: "error", message: "page too large to process safely" });
+      return res.status(502).send(JSON.stringify({ status: "error", message: "page too large to process safely" }));
     }
 
     let scorecardRaw = splitRawChunks(html);
@@ -137,36 +87,20 @@ module.exports = async function handler(req, res) {
     const liveCache = new Map();
     const squadsCache = new Map();
 
-    if (scan) {
-      return res.status(200).json({
-        status: "debug",
-        markers_found_scorecard_page: scanAllMarkers(scorecardRaw, scorecardCache),
-        markers_found_live_scores_page: scanAllMarkers(liveRaw, liveCache),
-        markers_found_squads_page: scanAllMarkers(squadsRaw, squadsCache),
-        fetch_and_split_ms: Date.now() - t0,
-      });
-    }
-
-    // ---- single-pass marker index eka hadanawa (CPU optimization) ----
     const scorecardNeededMarkers = [SCORECARD_MARKER, ...LIVE_MARKER_CANDIDATES, ...RECENT_KEY_CANDIDATES];
     const scorecardMarkerIndex = buildChunkMarkerIndex(scorecardRaw, scorecardNeededMarkers);
-
     const liveNeededMarkers = [...LIVE_MARKER_CANDIDATES, ...RECENT_KEY_CANDIDATES];
     const liveMarkerIndex = liveRaw.length ? buildChunkMarkerIndex(liveRaw, liveNeededMarkers) : new Map();
-
     const squadsMarkerIndex = squadsRaw.length ? buildChunkMarkerIndex(squadsRaw, SQUAD_TEAM_KEYS) : new Map();
 
     const data = findMarkerLazy(scorecardRaw, scorecardCache, SCORECARD_MARKER, scorecardMarkerIndex.get(SCORECARD_MARKER));
     if (!data) {
-      return res.status(502).json({
-        status: "error",
-        message: "could not find/parse scorecardApiData blob (match may not have started or page structure changed)",
-      });
+      return res.status(502).send(JSON.stringify({ status: "error", message: "could not find scorecardApiData" }));
     }
 
     const scoreCards = data.scoreCard || [];
     if (scoreCards.length === 0) {
-      return res.status(502).json({ status: "error", message: "no innings data yet" });
+      return res.status(502).send(JSON.stringify({ status: "error", message: "no innings data yet" }));
     }
 
     const current = scoreCards[scoreCards.length - 1];
@@ -198,11 +132,8 @@ module.exports = async function handler(req, res) {
       if (liveBlob.data.recentOvsStats) recent = String(liveBlob.data.recentOvsStats);
     }
 
-    let batDebug = null;
     if (batsmen.length === 0) {
-      const extracted = extractBatsmen(current);
-      batsmen = extracted.batsmen;
-      batDebug = extracted.debugInfo;
+      batsmen = extractBatsmen(current);
       if (batsmen.length > 0) batsmen[0].name = `${batsmen[0].name} *`;
     }
     batsmen = batsmen.slice(0, 2);
@@ -221,51 +152,32 @@ module.exports = async function handler(req, res) {
       if (midOverBowler) bowlerName = midOverBowler;
     }
 
-    let recentHit = null;
     if (recent === NF) {
       for (const key of RECENT_KEY_CANDIDATES) {
-        let hit = findKeyLazy(scorecardRaw, scorecardCache, key, "scorecard", scorecardMarkerIndex.get(key));
-        if (!hit) hit = findKeyLazy(liveRaw, liveCache, key, "live-scores", liveMarkerIndex.get(key));
-        if (hit) { recentHit = hit; break; }
-      }
-      if (recentHit) {
-        const v = recentHit.value;
-        recent = Array.isArray(v) ? v.join(", ") : String(v).trim();
+        let hit = findKeyLazy(scorecardRaw, scorecardCache, key, scorecardMarkerIndex.get(key));
+        if (!hit) hit = findKeyLazy(liveRaw, liveCache, key, liveMarkerIndex.get(key));
+        if (hit) {
+          recent = Array.isArray(hit) ? hit.join(", ") : String(hit).trim();
+          break;
+        }
       }
     }
 
-    // Match / Toss / Venue — this all lives on matchHeader, which we
-    // already have from the scorecard page's scorecardApiData blob.
     const matchInfo = extractMatchInfo(data.matchHeader || {});
 
-    // ---- Squads (both teams' Team Name + Playing XI only) ----
     let squads;
-    let squadsDebug;
     const directParsed = findSquadsObjectDirect(squadsRaw, squadsCache);
     if (directParsed) {
       squads = {
         team1: extractTeamNameAndPlayers(directParsed.team1),
         team2: extractTeamNameAndPlayers(directParsed.team2),
       };
-      squadsDebug = {
-        method: "direct-parse",
-        team1_players_keys: Object.keys((directParsed.team1 && directParsed.team1.players) || {}),
-        team2_players_keys: Object.keys((directParsed.team2 && directParsed.team2.players) || {}),
-      };
     } else {
-      // Fallback: old fuzzy candidate-scanning (in case page format changed).
       const team1Candidates = findAllMarkerObjects(squadsRaw, squadsCache, "team1", squadsMarkerIndex.get("team1"));
       const team2Candidates = findAllMarkerObjects(squadsRaw, squadsCache, "team2", squadsMarkerIndex.get("team2"));
       const fallbackTeam1 = (data.matchHeader && data.matchHeader.team1) || null;
       const fallbackTeam2 = (data.matchHeader && data.matchHeader.team2) || null;
-      const extracted = extractSquadsFuzzy(team1Candidates, team2Candidates, fallbackTeam1, fallbackTeam2);
-      squads = extracted.squads;
-      squadsDebug = {
-        method: "fuzzy-fallback",
-        team1_candidates_found: team1Candidates.length,
-        team2_candidates_found: team2Candidates.length,
-        ...extracted.debugInfo,
-      };
+      squads = extractSquadsFuzzy(team1Candidates, team2Candidates, fallbackTeam1, fallbackTeam2);
     }
 
     const result = {
@@ -282,20 +194,8 @@ module.exports = async function handler(req, res) {
       squads,
     };
 
-    // ================================================================
-    // NEW (v5): officials, series info, venue geo, match meta, media
-    // (videos/news/photos) - okkoma "matchInfo" blob eken (live-scores
-    // page eke commentaryPageData ekaka thiyena) + JSON-LD <script>
-    // blocks (SSR html ekema literal widiyata thiyena) eken gannawa.
-    // Field ekak hamba unne nathnam "-" (NF) danawa - "not found"
-    // kiyala danne na. Meka fail una athata pawa uda thiyena `result`
-    // eka (score/batsmen/squads etc) ekka BADDA wenne na.
-    // ================================================================
     try {
-      const matchInfoBlob =
-        findMarkerLazy(liveRaw, liveCache, "matchInfo", undefined) ||
-        findMarkerLazy(scorecardRaw, scorecardCache, "matchInfo", undefined);
-
+      const matchInfoBlob = findRichMatchInfo(liveRaw, liveCache) || findRichMatchInfo(scorecardRaw, scorecardCache);
       const extended = extractExtendedMatchInfo(data.matchHeader || {}, matchInfoBlob);
 
       result.matchMeta = {
@@ -331,14 +231,9 @@ module.exports = async function handler(req, res) {
         longitude: nf(extended.venueDetails.longitude),
       };
 
-      // ---- JSON-LD sidebar blocks (videos/news/photos) - both pages ----
       const ldLive = extractJsonLdSidebars(liveHtml);
       const ldScorecard = extractJsonLdSidebars(html);
 
-      // ---- videos: prefer chunk "videoList" (duration + real link
-      // okkomama thiyenawa), nathnam JSON-LD VideoObject (title+
-      // duration+link, videoType nathi) "matchVideos" chunk ekakin
-      // enrich karanawa (Press Conference / Analysis tag ekata) ----
       let videosFinal = [];
       const videoListRaw =
         findArrayMarkerLazy(liveRaw, liveCache, "videoList", undefined) ||
@@ -380,12 +275,10 @@ module.exports = async function handler(req, res) {
       const pressConferenceVideos = videosFinal.filter((v) => String(v.videoType).toLowerCase().includes("press"));
       const highlightVideos = videosFinal.filter((v) => !String(v.videoType).toLowerCase().includes("press"));
 
-      // ---- news (title + link; reliable timestamp source nathi nisa "-") ----
       let newsArticles = extractLinkedItems(liveHtml, NEWS_PATH_PREFIX, 8);
       if (newsArticles.length === 0) newsArticles = extractLinkedItems(html, NEWS_PATH_PREFIX, 8);
       newsArticles = newsArticles.map((n) => ({ title: nf(n.title), link: nf(n.link), date: NF }));
 
-      // ---- photos (title + link, thibba nam JSON-LD eken date eka enrich karanawa) ----
       let photoGallery = extractLinkedItems(liveHtml, GALLERY_PATH_PREFIX, 8);
       if (photoGallery.length === 0) photoGallery = extractLinkedItems(html, GALLERY_PATH_PREFIX, 8);
       const ldPhotos = ldLive.photos.length ? ldLive.photos : ldScorecard.photos;
@@ -400,118 +293,78 @@ module.exports = async function handler(req, res) {
         news: newsArticles.length ? newsArticles : NF,
         photos: photoGallery.length ? photoGallery : NF,
       };
-
-      if (debug) {
-        result.debug_extra = {
-          matchInfo_blob_found: !!matchInfoBlob,
-          videoList_found: Array.isArray(videoListRaw) && videoListRaw.length > 0,
-          videos_source: Array.isArray(videoListRaw) && videoListRaw.length > 0 ? "videoList-chunk" : "json-ld-fallback",
-        };
-      }
     } catch (e) {
       if (!result.matchMeta) result.matchMeta = NF;
       if (!result.officials) result.officials = NF;
       if (!result.series) result.series = NF;
       if (!result.venueDetails) result.venueDetails = NF;
       if (!result.media) result.media = NF;
-      if (debug) result.debug_extra = { error: String(e) };
     }
 
-    if (debug) {
-      result.debug = {
-        innings_count: scoreCards.length,
-        match_status: (data.matchHeader && data.matchHeader.status) || "unknown",
-        match_header_keys: Object.keys(data.matchHeader || {}),
-        live_blob_marker_used: liveBlob ? liveBlob.marker : null,
-        squads_extraction_debug: squadsDebug,
-        current_scorecard_top_level_keys: Object.keys(current),
-        batsmen_extraction_debug: batDebug,
-        recent_ticker_debug: recentHit || { note: "not found — try &debug=1&scan=1" },
-        total_ms: Date.now() - t0,
-        fetched_at: new Date().toISOString(),
-      };
-    }
-
-    res.setHeader("content-type", "application/json;charset=UTF-8");
+    CACHE = { data: result, expires: Date.now() + CACHE_TTL_MS };
     return res.status(200).send(JSON.stringify(result, null, 2));
   } catch (e) {
-    res.setHeader("content-type", "application/json;charset=UTF-8");
-    return res.status(500).send(JSON.stringify({ status: "error", message: String(e) }, null, 2));
+    return res.status(500).send(JSON.stringify({ status: "error", message: String(e) }));
   }
 };
 
-// Pulls "Match / Toss / Venue" out of matchHeader (already present in
-// scorecardApiData — no extra page fetch needed for this part). Tries a
-// few field-name variants defensively since Cricbuzz's exact shape can
-// shift between page builds.
 function extractMatchInfo(matchHeader) {
   const team1Name = (matchHeader.team1 && (matchHeader.team1.shortName || matchHeader.team1.name)) || "";
   const team2Name = (matchHeader.team2 && (matchHeader.team2.shortName || matchHeader.team2.name)) || "";
   const seriesName = (matchHeader.series && matchHeader.series.name) || matchHeader.seriesName || "";
   const desc = matchHeader.matchDescription || matchHeader.matchFormat || "";
-
   const matchParts = [team1Name && team2Name ? `${team1Name} vs ${team2Name}` : "", desc, seriesName].filter(Boolean);
   const match = matchParts.length ? matchParts.join(" • ") : NF;
-
   const toss = matchHeader.tossResults
     ? `${matchHeader.tossResults.tossWinnerName || NF} won the toss and opt to ${matchHeader.tossResults.decision || NF}`
     : matchHeader.tossStatus || NF;
-
   const venueObj = matchHeader.venue || {};
   const venueParts = [venueObj.ground || venueObj.name, venueObj.city].filter(Boolean);
   const venue = venueParts.length ? venueParts.join(", ") : NF;
-
   return { match, toss, venue };
 }
 
-// ---------- PRIMARY squads extraction: direct-parse the known real shape ----------
+function findBalancedEnd(str, startIdx, openChar, closeChar) {
+  let depth = 0;
+  let inString = false;
+  for (let j = startIdx; j < str.length; j++) {
+    const c = str[j];
+    if (inString) {
+      if (c === "\\") { j++; continue; }
+      if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { inString = true; continue; }
+    if (c === openChar) depth++;
+    else if (c === closeChar) { depth--; if (depth === 0) return j; }
+  }
+  return -1;
+}
 
-// Looks for the literal fingerprint `"team1":{"team":` which uniquely
-// identifies the squads props blob (as opposed to lightweight team refs
-// like matchHeader.team1 which look like {"teamId":2,"teamName":...}
-// with no "team" wrapper). Once found, walks back one char to the
-// opening `{` of the parent object `{"team1":{...},"team2":{...}}` and
-// brace-matches forward to grab the whole thing.
 function findSquadsObjectDirect(rawChunks, cache) {
   const FINGERPRINT = '"team1":{"team":';
   for (let i = 0; i < rawChunks.length; i++) {
     const decoded = decodeChunk(rawChunks, i, cache);
     const idx = decoded.indexOf(FINGERPRINT);
     if (idx === -1) continue;
-
     const objStart = idx - 1;
     if (objStart < 0 || decoded[objStart] !== "{") continue;
-
-    let depth = 0, end = -1;
-    for (let j = objStart; j < decoded.length; j++) {
-      const c = decoded[j];
-      if (c === "{") depth++;
-      else if (c === "}") { depth--; if (depth === 0) { end = j; break; } }
-    }
+    const end = findBalancedEnd(decoded, objStart, "{", "}");
     if (end === -1) continue;
-
     try {
       const parsed = JSON.parse(decoded.slice(objStart, end + 1));
       if (parsed && parsed.team1 && parsed.team2) return parsed;
-    } catch (e) {
-      continue;
-    }
+    } catch (e) { continue; }
   }
   return null;
 }
 
-// teamObj = { team: { teamName, teamSName, ... }, players: { "playing XI": [...], "bench": [...] } }
-// PURPOSELY only pulls the starting-XI array — bench / support staff
-// are excluded. Looks for a key containing "playing"/"xi"/"11" first;
-// skips anything that looks like "bench" or "support" along the way.
 function extractTeamNameAndPlayers(teamObj) {
   if (!teamObj) return { name: NF, players: [] };
   const teamInfo = teamObj.team || {};
   const name = teamInfo.teamName || teamInfo.name || teamInfo.teamSName || NF;
-
   const playersObj = teamObj.players || {};
   const keys = Object.keys(playersObj);
-
   let playingArr = null;
   for (const key of keys) {
     const lower = key.toLowerCase();
@@ -522,8 +375,6 @@ function extractTeamNameAndPlayers(teamObj) {
       break;
     }
   }
-  // Fallback: no key obviously named "playing XI" — take the first
-  // array that isn't bench/support.
   if (!playingArr) {
     for (const key of keys) {
       const lower = key.toLowerCase();
@@ -531,13 +382,9 @@ function extractTeamNameAndPlayers(teamObj) {
       if (Array.isArray(playersObj[key])) { playingArr = playersObj[key]; break; }
     }
   }
-
   return { name, players: extractPlayerNames(playingArr || []) };
 }
 
-// team object ekaka thiyena "players" style array ekaka namas okkoma
-// pluck karagannawa (string array ekak wenna puluwan, object array ekak
-// wenna puluwan)
 function extractPlayerNames(list) {
   if (!Array.isArray(list)) return [];
   return list
@@ -545,12 +392,6 @@ function extractPlayerNames(list) {
     .filter(Boolean);
 }
 
-// ---------- FALLBACK squads extraction: old fuzzy candidate-scanning ----------
-
-// value eka array ekak nam eka ehemama denawa. Object ekak nam (e.g.
-// "players": { "playing11": [...] } wage nested widiyakata una eka),
-// eke athule known-key ekak try karala, nathnam thiyena loku ම array
-// eka pahalata giya (depth 2ta witharak) hoyanawa.
 function flattenToPlayerArray(value, depth) {
   depth = depth || 0;
   if (Array.isArray(value)) return value;
@@ -569,23 +410,15 @@ function flattenToPlayerArray(value, depth) {
   return [];
 }
 
-// 1st: known key names try karanawa (PLAYER_LIST_KEYS) - value eka array
-// ekak wenna puluwan, nathnam array ekak wraps karana object ekak wenna
-// puluwan (flattenToPlayerArray eken handle karanawa).
-// 2nd: eka fail una nam, team object eke thiyena property *okkoma* balala,
-// name/playerName/fullName/id thiyena object tika (nathnam plain string
-// tika) witharak thiyena array tika athara loku ම eka gannawa.
-function findPlayersArrayWithSource(teamObj) {
+function findPlayersArray(teamObj) {
   for (const key of PLAYER_LIST_KEYS) {
     const val = teamObj[key];
-    if (Array.isArray(val) && val.length > 0) return { list: val, sourceKey: key };
+    if (Array.isArray(val) && val.length > 0) return val;
     if (val && typeof val === "object") {
       const nested = flattenToPlayerArray(val);
-      if (nested.length > 0) return { list: nested, sourceKey: `${key}.<nested>` };
+      if (nested.length > 0) return nested;
     }
   }
-
-  let bestKey = null;
   let best = [];
   for (const key of Object.keys(teamObj)) {
     const val = teamObj[key];
@@ -594,84 +427,35 @@ function findPlayersArrayWithSource(teamObj) {
     const looksLikePlayers = candidate.every(
       (p) => typeof p === "string" || (p && typeof p === "object" && (p.name || p.playerName || p.fullName || p.id))
     );
-    if (looksLikePlayers && candidate.length > best.length) { best = candidate; bestKey = key; }
+    if (looksLikePlayers && candidate.length > best.length) best = candidate;
   }
-  return { list: best, sourceKey: bestKey ? `fallback:${bestKey}` : null };
+  return best;
 }
 
-// candidates athare, players array eka loku ම thiyena object eka
-// (real squad object eka) thoraganawa - just a lightweight team-name
-// reference ekakata vaeradi widiyata thoranu labenna epa nisa.
 function pickBestTeamObject(candidates) {
   let best = null;
   let bestScore = -1;
-  let bestFind = { list: [], sourceKey: null };
   for (const c of candidates) {
     if (!c || typeof c !== "object") continue;
-    const found = findPlayersArrayWithSource(c);
-    if (found.list.length > bestScore) {
-      bestScore = found.list.length;
-      best = c;
-      bestFind = found;
-    }
+    const list = findPlayersArray(c);
+    if (list.length > bestScore) { bestScore = list.length; best = c; }
   }
-  return { obj: best, playersFind: bestFind };
+  return best;
 }
 
-// Pulls each team's Name + Players out of the squads page candidates
-// (used ONLY if the primary direct-parse above fails to find anything).
 function extractSquadsFuzzy(team1Candidates, team2Candidates, fallbackTeam1, fallbackTeam2) {
-  const debugInfo = { teams: [] };
-
   const build = (candidates, fallbackObj) => {
-    let obj = null;
-    let source = "not found";
-
-    if (candidates && candidates.length > 0) {
-      const picked = pickBestTeamObject(candidates);
-      if (picked.obj) {
-        obj = picked.obj;
-        source = picked.playersFind.list.length > 0
-          ? `squads-page (${candidates.length} candidate(s) checked)`
-          : `squads-page (${candidates.length} candidate(s), no players array found in any)`;
-      }
-    }
-
-    let list = [];
-    let sourceKey = null;
-    if (obj) {
-      const found = findPlayersArrayWithSource(obj);
-      list = found.list;
-      sourceKey = found.sourceKey;
-    }
-
-    if (list.length === 0 && fallbackObj) {
-      if (!obj) { obj = fallbackObj; source = "matchHeader fallback (name only, no players array on squads page)"; }
-      else source += " + matchHeader fallback for name";
-    }
-
-    if (!obj) {
-      debugInfo.teams.push({ found: false, source, candidates_checked: candidates ? candidates.length : 0 });
-      return { name: NF, players: [] };
-    }
-
+    let obj = candidates && candidates.length > 0 ? pickBestTeamObject(candidates) : null;
+    let list = obj ? findPlayersArray(obj) : [];
+    if (list.length === 0 && fallbackObj && !obj) obj = fallbackObj;
+    if (!obj) return { name: NF, players: [] };
     const name = obj.teamName || obj.name || obj.shortName || (fallbackObj && (fallbackObj.name || fallbackObj.shortName)) || NF;
-    debugInfo.teams.push({
-      name,
-      source,
-      team_object_keys: Object.keys(obj),
-      players_source_key: sourceKey,
-      players_count: list.length,
-      candidates_checked: candidates ? candidates.length : 0,
-    });
     return { name, players: extractPlayerNames(list) };
   };
-
-  const squads = {
+  return {
     team1: build(team1Candidates, fallbackTeam1),
     team2: build(team2Candidates, fallbackTeam2),
   };
-  return { squads, debugInfo };
 }
 
 function extractBatsmen(current) {
@@ -681,13 +465,8 @@ function extractBatsmen(current) {
     teamNode.batters, teamNode.players, current.batsmenData,
   ];
   const roster = rosterCandidates.find((r) => r && (Array.isArray(r) ? r.length > 0 : Object.keys(r).length > 0));
-  const debugInfo = { bat_team_node_keys: Object.keys(teamNode), roster_found: !!roster };
-  if (!roster) return { batsmen: [], debugInfo };
-
+  if (!roster) return [];
   const entries = Array.isArray(roster) ? roster : Object.values(roster);
-  debugInfo.roster_entry_count = entries.length;
-  debugInfo.sample_raw_entry = entries[0] || null;
-
   const notOut = [];
   for (const b of entries) {
     if (!b || typeof b !== "object") continue;
@@ -700,7 +479,7 @@ function extractBatsmen(current) {
     const balls = b.balls ?? b.batBalls ?? b.b ?? 0;
     notOut.push({ name, score: `${runs}(${balls})` });
   }
-  return { batsmen: notOut, debugInfo };
+  return notOut;
 }
 
 function splitRawChunks(html) {
@@ -728,14 +507,11 @@ function escapeRegex(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-// ---- CPU optimization: single-pass multi-marker scan ----
 function buildChunkMarkerIndex(rawChunks, markers) {
   const uniqueMarkers = Array.from(new Set(markers));
   const index = new Map(uniqueMarkers.map((m) => [m, []]));
   if (uniqueMarkers.length === 0 || rawChunks.length === 0) return index;
-
   const combined = new RegExp('\\\\"(?:' + uniqueMarkers.map(escapeRegex).join("|") + ')\\\\"');
-
   for (let i = 0; i < rawChunks.length; i++) {
     const chunk = rawChunks[i];
     if (!combined.test(chunk)) continue;
@@ -767,23 +543,13 @@ function findMarkerLazy(rawChunks, cache, marker, candidateIndices) {
     if (idx === -1) continue;
     const braceStart = decoded.indexOf("{", idx);
     if (braceStart === -1) continue;
-    let depth = 0, end = -1;
-    for (let j = braceStart; j < decoded.length; j++) {
-      const c = decoded[j];
-      if (c === "{") depth++;
-      else if (c === "}") { depth--; if (depth === 0) { end = j; break; } }
-    }
+    const end = findBalancedEnd(decoded, braceStart, "{", "}");
     if (end === -1) continue;
     try { return JSON.parse(decoded.slice(braceStart, end + 1)); } catch (e) { continue; }
   }
   return null;
 }
 
-// findMarkerLazy wage-mai, eth thani match ekakin nathuwa (marker ekē
-// text page ekaka thana godayakin enna puluwan nisa - lightweight ref
-// ekak + real object eka), hambena okkoma (maxResults dakwa) collect
-// karala return karanawa. Caller ekage ithuru logic ekakin "hariyata
-// thiyena" eka thoraganna puluwan (e.g. players array ekak thiyena eka).
 function findAllMarkerObjects(rawChunks, cache, marker, candidateIndices, maxResults) {
   maxResults = maxResults || 5;
   const indices = candidateIndices || rawChunks.map((_, i) => i);
@@ -797,30 +563,42 @@ function findAllMarkerObjects(rawChunks, cache, marker, candidateIndices, maxRes
       if (idx === -1) break;
       const braceStart = decoded.indexOf("{", idx);
       if (braceStart === -1) break;
-      let depth = 0, end = -1;
-      for (let j = braceStart; j < decoded.length; j++) {
-        const c = decoded[j];
-        if (c === "{") depth++;
-        else if (c === "}") { depth--; if (depth === 0) { end = j; break; } }
-      }
+      const end = findBalancedEnd(decoded, braceStart, "{", "}");
       if (end === -1) break;
-      try {
-        results.push(JSON.parse(decoded.slice(braceStart, end + 1)));
-      } catch (e) {
-        // ignore, keep scanning
-      }
+      try { results.push(JSON.parse(decoded.slice(braceStart, end + 1))); } catch (e) {}
       searchFrom = end + 1;
     }
   }
   return results;
 }
 
-function findKeyLazy(rawChunks, cache, key, label, candidateIndices) {
+function findRichMatchInfo(rawChunks, cache) {
+  const FINGERPRINT = '"matchInfo":{';
+  for (let i = 0; i < rawChunks.length; i++) {
+    const decoded = decodeChunk(rawChunks, i, cache);
+    let searchFrom = 0;
+    while (true) {
+      const idx = decoded.indexOf(FINGERPRINT, searchFrom);
+      if (idx === -1) break;
+      const braceStart = idx + FINGERPRINT.length - 1;
+      const end = findBalancedEnd(decoded, braceStart, "{", "}");
+      if (end === -1) { searchFrom = idx + FINGERPRINT.length; continue; }
+      try {
+        const parsed = JSON.parse(decoded.slice(braceStart, end + 1));
+        if (parsed && (parsed.umpire1 || parsed.referee || parsed.series)) return parsed;
+      } catch (e) {}
+      searchFrom = end + 1;
+    }
+  }
+  return null;
+}
+
+function findKeyLazy(rawChunks, cache, key, candidateIndices) {
   const indices = candidateIndices || rawChunks.map((_, i) => i);
   for (const i of indices) {
     const decoded = decodeChunk(rawChunks, i, cache);
     const val = extractValueAfterKey(decoded, key);
-    if (val !== undefined && val !== null && String(val).length > 0) return { key, value: val, source: label };
+    if (val !== undefined && val !== null && String(val).length > 0) return val;
   }
   return null;
 }
@@ -843,13 +621,10 @@ function extractValueAfterKey(chunk, key) {
   }
 
   if (c === "[" || c === "{") {
-    const open = c, close = c === "[" ? "]" : "}";
-    let depth = 0, j = i;
-    for (; j < chunk.length; j++) {
-      if (chunk[j] === open) depth++;
-      else if (chunk[j] === close) { depth--; if (depth === 0) { j++; break; } }
-    }
-    const raw = chunk.slice(i, j);
+    const close = c === "[" ? "]" : "}";
+    const end = findBalancedEnd(chunk, i, c, close);
+    if (end === -1) return undefined;
+    const raw = chunk.slice(i, end + 1);
     try { return JSON.parse(raw); } catch (e) { return raw; }
   }
 
@@ -857,21 +632,6 @@ function extractValueAfterKey(chunk, key) {
   while (j < chunk.length && !",}]".includes(chunk[j])) j++;
   return chunk.slice(i, j).trim();
 }
-
-function scanAllMarkers(rawChunks, cache) {
-  const found = new Set();
-  for (let i = 0; i < rawChunks.length; i++) {
-    const decoded = decodeChunk(rawChunks, i, cache);
-    const bounded = decoded.length > 20000 ? decoded.slice(0, 20000) : decoded;
-    const matches = bounded.match(/"([a-zA-Z][a-zA-Z0-9_]{2,40})":\{/g) || [];
-    for (const m of matches) found.add(m.slice(1, -2));
-  }
-  return Array.from(found).sort();
-}
-
-// ================================================================
-// NEW (v5) HELPERS - officials/series/venue/meta/media extraction
-// ================================================================
 
 function firstDefined(...vals) {
   for (const v of vals) {
@@ -903,9 +663,6 @@ function extractSeriesResultText(seriesObj) {
   return seriesObj.testSeriesResult || seriesObj.odiSeriesResult || seriesObj.t20SeriesResult || undefined;
 }
 
-// matchHeader (scorecardApiData eken) + matchInfoBlob (live-scores page
-// eke commentaryPageData ekaka thiyena "matchInfo" object eka) dekakama
-// check karala, field ekak koi tanaka hambunath eka gannawa.
 function extractExtendedMatchInfo(matchHeader, matchInfoBlob) {
   const mh = matchHeader || {};
   const mi = matchInfoBlob || {};
@@ -945,9 +702,6 @@ function extractExtendedMatchInfo(matchHeader, matchInfoBlob) {
   };
 }
 
-// bracket-matching version of findMarkerLazy — for top-level ARRAY values
-// like "videoList":[ ... ] / "matchVideos":[ ... ] (findMarkerLazy eken
-// OBJECT values ("{" walin patan gannana) witharak handle wenne).
 function findArrayMarkerLazy(rawChunks, cache, marker, candidateIndices) {
   const indices = candidateIndices || rawChunks.map((_, i) => i);
   for (const i of indices) {
@@ -956,21 +710,13 @@ function findArrayMarkerLazy(rawChunks, cache, marker, candidateIndices) {
     if (idx === -1) continue;
     const bracketStart = decoded.indexOf("[", idx);
     if (bracketStart === -1) continue;
-    let depth = 0, end = -1;
-    for (let j = bracketStart; j < decoded.length; j++) {
-      const c = decoded[j];
-      if (c === "[") depth++;
-      else if (c === "]") { depth--; if (depth === 0) { end = j; break; } }
-    }
+    const end = findBalancedEnd(decoded, bracketStart, "[", "]");
     if (end === -1) continue;
     try { return JSON.parse(decoded.slice(bracketStart, end + 1)); } catch (e) { continue; }
   }
   return null;
 }
 
-// "matchVideos" array eken id + videoType + title witharak (Press
-// Conference / Analysis wage tag eka) - "videoList" eke videoType
-// nathi welawaka meken enrich karanna use karanawa.
 function extractMatchVideosMeta(rawChunks, cache) {
   const arr = findArrayMarkerLazy(rawChunks, cache, "matchVideos", undefined);
   if (!Array.isArray(arr)) return [];
@@ -979,10 +725,6 @@ function extractMatchVideosMeta(rawChunks, cache) {
     .filter((v) => v.id);
 }
 
-// Cricbuzz SSR-karana <script type="application/ld+json"> WPSideBar
-// blocks (Featured Videos / Latest News / Latest Photos okkomatama
-// meke pattern ekama) - raw HTML text ekema literal widiyata thiyena
-// nisa chunk-decode karanna one na, kelinma regex karanawa.
 function extractJsonLdSidebars(rawHtml) {
   const out = { newsArticles: [], photos: [], videos: [] };
   if (!rawHtml) return out;
@@ -1012,9 +754,6 @@ function extractJsonLdSidebars(rawHtml) {
   return out;
 }
 
-// "LATEST NEWS" / "LATEST PHOTOS" widiyata thiyena links - anchor href
-// eka + langama thiyena "mb-2.5" title div eka regex ekakin pair
-// karanawa (raw SSR html ekema thiyena nisa chunk-decode one na).
 function extractLinkedItems(rawHtml, pathPrefix, maxResults) {
   maxResults = maxResults || 8;
   const items = [];
