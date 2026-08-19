@@ -1,6 +1,18 @@
 // Cricbuzz eken TEAM NAMES + PLAYERS witharak ganna simplified version eka.
-// (score, toss, venue, batsmen, bowler wagē tika okkoma ain karala
-//  squads eka witharak return karanawa)
+// v2 UPDATE: user dunna raw HTML eken squads page eke ida REAL structure
+// eka confirm kala -
+//   { "team1": { "team": { teamId, teamName, teamSName, ... },
+//                "players": { "playing XI": [ {name,...}, ... ],
+//                             "bench":      [ {name,...}, ... ] } },
+//     "team2": { ...same shape... } }
+// "team1"/"team2" deka thani object ekakama keys widiyata thiyenne
+// ("$L26" component ekata denna props tika), eka nisa dan guess-scanning
+// ekak karanna one na - "\"team1\":{\"team\":" kiyana fingerprint eken
+// kelinma object eka locate karala pluck karanawa. Name eka team1.team.teamName,
+// players eka team1.players athule thiyena okkoma array (playing XI +
+// bench) flatten karala.
+// Format wenas una nam / fingerprint eka hamba unේ nathnam, pahala election
+// fuzzy candidate-scanning fallback ekata weradi widiyata backup widiyata.
 // ================================================================
 // ================================================================
 //                  MATCH LINK EKA METHANATA DANNA
@@ -8,14 +20,6 @@
 const MATCH_URL = "https://www.cricbuzz.com/live-cricket-scores/154410/jkm-vs-snp-10th-match-caribbean-premier-league-2026";
 // ================================================================
 // ================================================================
-//
-// Original file eke thibbe squad-extraction logic eka witharai methanata
-// copy kalේ (findAllMarkerObjects / pickBestTeamObject / flattenToPlayerArray
-// wagē tika okkoma vaeradi nathiwa hariyata wada karana logic - eka
-// wenas kalේ nehe). Ain kala eka: SCORECARD_MARKER, LIVE_MARKER_CANDIDATES,
-// RECENT_KEY_CANDIDATES, matchInfo (match/toss/venue), batsmen, bowler,
-// recent overs - okkoma. `?debug=1` daalot squads_extraction_debug eka
-// witharak penei.
 
 const SQUAD_TEAM_KEYS = ["team1", "team2"];
 const PLAYER_LIST_KEYS = ["players", "playerList", "squad", "playing11", "playingXI", "playersList"];
@@ -93,23 +97,44 @@ module.exports = async function handler(req, res) {
     const squadsCache = new Map();
     const scorecardCache = new Map();
 
-    const squadsMarkerIndex = squadsRaw.length ? buildChunkMarkerIndex(squadsRaw, SQUAD_TEAM_KEYS) : new Map();
+    let squads;
+    let debugInfo;
 
-    const team1Candidates = findAllMarkerObjects(squadsRaw, squadsCache, "team1", squadsMarkerIndex.get("team1"));
-    const team2Candidates = findAllMarkerObjects(squadsRaw, squadsCache, "team2", squadsMarkerIndex.get("team2"));
+    // 1) PRIMARY: direct-parse the known real shape.
+    const directParsed = findSquadsObjectDirect(squadsRaw, squadsCache);
+    if (directParsed) {
+      squads = {
+        team1: extractTeamNameAndPlayers(directParsed.team1),
+        team2: extractTeamNameAndPlayers(directParsed.team2),
+      };
+      debugInfo = {
+        method: "direct-parse",
+        team1_top_keys: Object.keys(directParsed.team1 || {}),
+        team2_top_keys: Object.keys(directParsed.team2 || {}),
+        team1_players_keys: Object.keys((directParsed.team1 && directParsed.team1.players) || {}),
+        team2_players_keys: Object.keys((directParsed.team2 && directParsed.team2.players) || {}),
+      };
+    } else {
+      // 2) FALLBACK: old fuzzy candidate-scanning (in case page format changed).
+      const squadsMarkerIndex = squadsRaw.length ? buildChunkMarkerIndex(squadsRaw, SQUAD_TEAM_KEYS) : new Map();
+      const team1Candidates = findAllMarkerObjects(squadsRaw, squadsCache, "team1", squadsMarkerIndex.get("team1"));
+      const team2Candidates = findAllMarkerObjects(squadsRaw, squadsCache, "team2", squadsMarkerIndex.get("team2"));
 
-    let fallbackTeam1 = null;
-    let fallbackTeam2 = null;
-    if (scorecardRaw.length) {
-      const scMarkerIndex = buildChunkMarkerIndex(scorecardRaw, ["scorecardApiData"]);
-      const data = findMarkerLazy(scorecardRaw, scorecardCache, "scorecardApiData", scMarkerIndex.get("scorecardApiData"));
-      if (data && data.matchHeader) {
-        fallbackTeam1 = data.matchHeader.team1 || null;
-        fallbackTeam2 = data.matchHeader.team2 || null;
+      let fallbackTeam1 = null;
+      let fallbackTeam2 = null;
+      if (scorecardRaw.length) {
+        const scMarkerIndex = buildChunkMarkerIndex(scorecardRaw, ["scorecardApiData"]);
+        const data = findMarkerLazy(scorecardRaw, scorecardCache, "scorecardApiData", scMarkerIndex.get("scorecardApiData"));
+        if (data && data.matchHeader) {
+          fallbackTeam1 = data.matchHeader.team1 || null;
+          fallbackTeam2 = data.matchHeader.team2 || null;
+        }
       }
-    }
 
-    const { squads, debugInfo } = extractSquads(team1Candidates, team2Candidates, fallbackTeam1, fallbackTeam2);
+      const extracted = extractSquadsFuzzy(team1Candidates, team2Candidates, fallbackTeam1, fallbackTeam2);
+      squads = extracted.squads;
+      debugInfo = { method: "fuzzy-fallback", ...extracted.debugInfo };
+    }
 
     const result = {
       status: "success",
@@ -119,8 +144,6 @@ module.exports = async function handler(req, res) {
 
     if (debug) {
       result.debug = {
-        squads_team1_candidates_found: team1Candidates.length,
-        squads_team2_candidates_found: team2Candidates.length,
         squads_extraction_debug: debugInfo,
         total_ms: Date.now() - t0,
         fetched_at: new Date().toISOString(),
@@ -135,7 +158,59 @@ module.exports = async function handler(req, res) {
   }
 };
 
-// ---------- squad extraction (original logic, unchanged) ----------
+// ---------- PRIMARY: direct-parse the known real squads shape ----------
+
+// Looks for the literal fingerprint `"team1":{"team":` which uniquely
+// identifies the squads props blob (as opposed to lightweight team refs
+// like matchHeader.team1 which look like {"teamId":2,"teamName":...}
+// with no "team" wrapper). Once found, walks back one char to the
+// opening `{` of the parent object `{"team1":{...},"team2":{...}}` and
+// brace-matches forward to grab the whole thing.
+function findSquadsObjectDirect(rawChunks, cache) {
+  const FINGERPRINT = '"team1":{"team":';
+  for (let i = 0; i < rawChunks.length; i++) {
+    const decoded = decodeChunk(rawChunks, i, cache);
+    const idx = decoded.indexOf(FINGERPRINT);
+    if (idx === -1) continue;
+
+    const objStart = idx - 1;
+    if (objStart < 0 || decoded[objStart] !== "{") continue;
+
+    let depth = 0, end = -1;
+    for (let j = objStart; j < decoded.length; j++) {
+      const c = decoded[j];
+      if (c === "{") depth++;
+      else if (c === "}") { depth--; if (depth === 0) { end = j; break; } }
+    }
+    if (end === -1) continue;
+
+    try {
+      const parsed = JSON.parse(decoded.slice(objStart, end + 1));
+      if (parsed && parsed.team1 && parsed.team2) return parsed;
+    } catch (e) {
+      continue;
+    }
+  }
+  return null;
+}
+
+// teamObj = { team: { teamName, teamSName, ... }, players: { "playing XI": [...], "bench": [...] } }
+// Flattens EVERY array found under `players` (regardless of the exact
+// key names, since they can vary a bit: "playing XI", "bench", maybe
+// others for different formats) into one player-name list.
+function extractTeamNameAndPlayers(teamObj) {
+  if (!teamObj) return { name: NF, players: [] };
+  const teamInfo = teamObj.team || {};
+  const name = teamInfo.teamName || teamInfo.name || teamInfo.teamSName || NF;
+
+  const playersObj = teamObj.players || {};
+  let players = [];
+  for (const key of Object.keys(playersObj)) {
+    const arr = playersObj[key];
+    if (Array.isArray(arr)) players = players.concat(extractPlayerNames(arr));
+  }
+  return { name, players };
+}
 
 function extractPlayerNames(list) {
   if (!Array.isArray(list)) return [];
@@ -143,6 +218,8 @@ function extractPlayerNames(list) {
     .map((p) => (typeof p === "string" ? p : (p && (p.name || p.playerName || p.fullName)) || null))
     .filter(Boolean);
 }
+
+// ---------- FALLBACK: old fuzzy candidate-scanning ----------
 
 function flattenToPlayerArray(value, depth) {
   depth = depth || 0;
@@ -202,7 +279,7 @@ function pickBestTeamObject(candidates) {
   return { obj: best, playersFind: bestFind };
 }
 
-function extractSquads(team1Candidates, team2Candidates, fallbackTeam1, fallbackTeam2) {
+function extractSquadsFuzzy(team1Candidates, team2Candidates, fallbackTeam1, fallbackTeam2) {
   const debugInfo = { teams: [] };
 
   const build = (candidates, fallbackObj) => {
@@ -256,7 +333,7 @@ function extractSquads(team1Candidates, team2Candidates, fallbackTeam1, fallback
   return { squads, debugInfo };
 }
 
-// ---------- chunk parsing helpers (original logic, unchanged) ----------
+// ---------- chunk parsing helpers (unchanged) ----------
 
 function splitRawChunks(html) {
   const chunks = [];
