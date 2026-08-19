@@ -3,5 +3,9 @@
     "api/score.js": {
       "maxDuration": 10
     }
-  }
+  },
+  "rewrites": [
+    { "source": "/", "destination": "/api/score" },
+    { "source": "/(.*)", "destination": "/api/score" }
+  ]
 }
