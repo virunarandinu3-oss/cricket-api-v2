@@ -27,6 +27,23 @@ const MATCH_URL = "https://www.cricbuzz.com/live-cricket-scores/163013/sl-vs-ind
 //    pahala fuzzy candidate-scanning eka backup widiyata thiyenawa.
 // 5) `?debug=1` daalama squads_extraction_debug.method eke "direct-parse"
 //    nathnam "fuzzy-fallback" kiyala penei.
+//
+// MEKA UPDATE EKA (v5) - alut features - PURANA DEYAK WENAS KALE NA,
+// AWULAK ETHTHOTH NAWATHA add witharak kala:
+// 6) Match Officials / Series info: umpire1/2/3, referee, series
+//    result (e.g "Series levelled 0-0"), series start/end date.
+// 7) Venue geo details: city, country, timezone, latitude, longitude.
+// 8) Match Meta: matchFormat, dayNumber, dayNight, state, shortStatus,
+//    livestreamEnabled + livestreamEnabledGeo list, isFantasyEnabled.
+// 9) Media: highlight videos + press-conference videos (venama tag
+//    karala), latest news (title+link), latest photo gallery
+//    (title+link+date). Source eka: live-scores page eke JS chunk
+//    ekaka thiyena "matchInfo"/"videoList"/"matchVideos" blobs, saha
+//    SSR html ekema literal widiyata thiyena JSON-LD <script> tags.
+//    Field ekak hamba unne nathnam "-" (NF) - "not found" text ekak
+//    kisi welawaka danne na. Meka okkoma try/catch ekakin wrap karala
+//    thiyenne - meka fail una athata pawa purana result eka (score,
+//    batsmen, squads, etc) EKA WELAWAKATWATA break wenne na.
 
 const SCORECARD_MARKER = "scorecardApiData";
 const LIVE_MARKER_CANDIDATES = ["miniscore", "matchScoreDetails", "liveApiData", "commentaryApiData", "faceoffApiData"];
@@ -42,6 +59,10 @@ const MAX_HTML_BYTES = 6 * 1024 * 1024;
 const MAX_CHUNKS = 400;
 
 const NF = "-"; // "not found" wenuwata methanin danna thani akura
+
+// ---- NEW (v5) consts: news/photo link scanning ----
+const NEWS_PATH_PREFIX = "/cricket-news";
+const GALLERY_PATH_PREFIX = "/cricket-gallery";
 
 function extractMatchIdFromLink(link) {
   const m = String(link).match(/cricbuzz\.com\/live-cricket-(?:scores|scorecard)\/(\d{4,20})\//);
@@ -260,6 +281,141 @@ module.exports = async function handler(req, res) {
       recent: nf(recent),
       squads,
     };
+
+    // ================================================================
+    // NEW (v5): officials, series info, venue geo, match meta, media
+    // (videos/news/photos) - okkoma "matchInfo" blob eken (live-scores
+    // page eke commentaryPageData ekaka thiyena) + JSON-LD <script>
+    // blocks (SSR html ekema literal widiyata thiyena) eken gannawa.
+    // Field ekak hamba unne nathnam "-" (NF) danawa - "not found"
+    // kiyala danne na. Meka fail una athata pawa uda thiyena `result`
+    // eka (score/batsmen/squads etc) ekka BADDA wenne na.
+    // ================================================================
+    try {
+      const matchInfoBlob =
+        findMarkerLazy(liveRaw, liveCache, "matchInfo", undefined) ||
+        findMarkerLazy(scorecardRaw, scorecardCache, "matchInfo", undefined);
+
+      const extended = extractExtendedMatchInfo(data.matchHeader || {}, matchInfoBlob);
+
+      result.matchMeta = {
+        format: nf(extended.meta.format),
+        dayNumber: nf(extended.meta.dayNumber),
+        dayNight: extended.meta.dayNight === undefined ? NF : extended.meta.dayNight,
+        state: nf(extended.meta.state),
+        shortStatus: nf(extended.meta.shortStatus),
+        livestreamEnabled: extended.meta.livestreamEnabled === undefined ? NF : extended.meta.livestreamEnabled,
+        livestreamEnabledGeo: Array.isArray(extended.meta.livestreamEnabledGeo) ? extended.meta.livestreamEnabledGeo : NF,
+        isFantasyEnabled: extended.meta.isFantasyEnabled === undefined ? NF : extended.meta.isFantasyEnabled,
+      };
+
+      result.officials = {
+        umpire1: nf(extended.officials.umpire1),
+        umpire2: nf(extended.officials.umpire2),
+        umpire3: nf(extended.officials.umpire3),
+        referee: nf(extended.officials.referee),
+      };
+
+      result.series = {
+        name: nf(extended.series.name),
+        result: nf(extended.series.result),
+        startDate: nf(extended.series.startDate),
+        endDate: nf(extended.series.endDate),
+      };
+
+      result.venueDetails = {
+        city: nf(extended.venueDetails.city),
+        country: nf(extended.venueDetails.country),
+        timezone: nf(extended.venueDetails.timezone),
+        latitude: nf(extended.venueDetails.latitude),
+        longitude: nf(extended.venueDetails.longitude),
+      };
+
+      // ---- JSON-LD sidebar blocks (videos/news/photos) - both pages ----
+      const ldLive = extractJsonLdSidebars(liveHtml);
+      const ldScorecard = extractJsonLdSidebars(html);
+
+      // ---- videos: prefer chunk "videoList" (duration + real link
+      // okkomama thiyenawa), nathnam JSON-LD VideoObject (title+
+      // duration+link, videoType nathi) "matchVideos" chunk ekakin
+      // enrich karanawa (Press Conference / Analysis tag ekata) ----
+      let videosFinal = [];
+      const videoListRaw =
+        findArrayMarkerLazy(liveRaw, liveCache, "videoList", undefined) ||
+        findArrayMarkerLazy(scorecardRaw, scorecardCache, "videoList", undefined);
+
+      if (Array.isArray(videoListRaw) && videoListRaw.length > 0) {
+        videosFinal = videoListRaw
+          .map((entry) => entry && entry.video)
+          .filter(Boolean)
+          .map((v) => ({
+            title: nf(v.title),
+            duration: nf(v.durationStr),
+            videoType: nf(v.videoType),
+            link: nf(v.videoUrl),
+            thumbnailId: nf(v.imageId),
+            thumbnail: NF,
+          }));
+      } else {
+        const ldVideos = ldLive.videos.length ? ldLive.videos : ldScorecard.videos;
+        const matchVideosMeta = (() => {
+          const a = extractMatchVideosMeta(liveRaw, liveCache);
+          return a.length ? a : extractMatchVideosMeta(scorecardRaw, scorecardCache);
+        })();
+        videosFinal = ldVideos.map((v) => {
+          const idMatch = String(v.link || "").match(/cricket-videos\/(\d+)\//);
+          const meta = idMatch ? matchVideosMeta.find((mm) => String(mm.id) === idMatch[1]) : null;
+          return {
+            title: nf(v.title),
+            duration: nf(v.duration),
+            videoType: nf(meta && meta.videoType),
+            link: nf(v.link),
+            thumbnailId: NF,
+            thumbnail: nf(v.thumbnail),
+          };
+        });
+      }
+
+      videosFinal = videosFinal.slice(0, 10);
+      const pressConferenceVideos = videosFinal.filter((v) => String(v.videoType).toLowerCase().includes("press"));
+      const highlightVideos = videosFinal.filter((v) => !String(v.videoType).toLowerCase().includes("press"));
+
+      // ---- news (title + link; reliable timestamp source nathi nisa "-") ----
+      let newsArticles = extractLinkedItems(liveHtml, NEWS_PATH_PREFIX, 8);
+      if (newsArticles.length === 0) newsArticles = extractLinkedItems(html, NEWS_PATH_PREFIX, 8);
+      newsArticles = newsArticles.map((n) => ({ title: nf(n.title), link: nf(n.link), date: NF }));
+
+      // ---- photos (title + link, thibba nam JSON-LD eken date eka enrich karanawa) ----
+      let photoGallery = extractLinkedItems(liveHtml, GALLERY_PATH_PREFIX, 8);
+      if (photoGallery.length === 0) photoGallery = extractLinkedItems(html, GALLERY_PATH_PREFIX, 8);
+      const ldPhotos = ldLive.photos.length ? ldLive.photos : ldScorecard.photos;
+      photoGallery = photoGallery.map((p) => {
+        const match = ldPhotos.find((lp) => lp.title === p.title);
+        return { title: nf(p.title), link: nf(p.link), date: nf(match && match.date) };
+      });
+
+      result.media = {
+        highlightVideos: highlightVideos.length ? highlightVideos : NF,
+        pressConferenceVideos: pressConferenceVideos.length ? pressConferenceVideos : NF,
+        news: newsArticles.length ? newsArticles : NF,
+        photos: photoGallery.length ? photoGallery : NF,
+      };
+
+      if (debug) {
+        result.debug_extra = {
+          matchInfo_blob_found: !!matchInfoBlob,
+          videoList_found: Array.isArray(videoListRaw) && videoListRaw.length > 0,
+          videos_source: Array.isArray(videoListRaw) && videoListRaw.length > 0 ? "videoList-chunk" : "json-ld-fallback",
+        };
+      }
+    } catch (e) {
+      if (!result.matchMeta) result.matchMeta = NF;
+      if (!result.officials) result.officials = NF;
+      if (!result.series) result.series = NF;
+      if (!result.venueDetails) result.venueDetails = NF;
+      if (!result.media) result.media = NF;
+      if (debug) result.debug_extra = { error: String(e) };
+    }
 
     if (debug) {
       result.debug = {
@@ -711,4 +867,167 @@ function scanAllMarkers(rawChunks, cache) {
     for (const m of matches) found.add(m.slice(1, -2));
   }
   return Array.from(found).sort();
+}
+
+// ================================================================
+// NEW (v5) HELPERS - officials/series/venue/meta/media extraction
+// ================================================================
+
+function firstDefined(...vals) {
+  for (const v of vals) {
+    if (v !== undefined && v !== null && v !== "") return v;
+  }
+  return undefined;
+}
+
+function formatPersonInfo(p) {
+  if (!p || typeof p !== "object") return undefined;
+  const name = p.name || p.fullName;
+  if (!name) return undefined;
+  return p.country ? `${name} (${p.country})` : name;
+}
+
+function formatEpochDate(ms) {
+  if (ms === undefined || ms === null || ms === "") return undefined;
+  try {
+    const d = new Date(Number(ms));
+    if (isNaN(d.getTime())) return undefined;
+    return d.toISOString().slice(0, 10);
+  } catch (e) {
+    return undefined;
+  }
+}
+
+function extractSeriesResultText(seriesObj) {
+  if (!seriesObj || typeof seriesObj !== "object") return undefined;
+  return seriesObj.testSeriesResult || seriesObj.odiSeriesResult || seriesObj.t20SeriesResult || undefined;
+}
+
+// matchHeader (scorecardApiData eken) + matchInfoBlob (live-scores page
+// eke commentaryPageData ekaka thiyena "matchInfo" object eka) dekakama
+// check karala, field ekak koi tanaka hambunath eka gannawa.
+function extractExtendedMatchInfo(matchHeader, matchInfoBlob) {
+  const mh = matchHeader || {};
+  const mi = matchInfoBlob || {};
+  const venue = mi.venue || mh.venue || {};
+  const series = mi.series || {};
+
+  return {
+    meta: {
+      format: firstDefined(mh.matchFormat, mi.matchFormat),
+      dayNumber: firstDefined(mi.dayNumber, mh.dayNumber),
+      dayNight: firstDefined(mh.dayNight, mi.dayNight),
+      state: firstDefined(mh.state, mi.state),
+      shortStatus: firstDefined(mi.shortStatus, mh.shortStatus),
+      livestreamEnabled: firstDefined(mh.livestreamEnabled, mi.livestreamEnabled),
+      livestreamEnabledGeo: firstDefined(mi.livestreamEnabledGeo, mh.livestreamEnabledGeo),
+      isFantasyEnabled: firstDefined(mi.isFantasyEnabled, mh.isFantasyEnabled),
+    },
+    officials: {
+      umpire1: formatPersonInfo(mi.umpire1 || mh.umpire1),
+      umpire2: formatPersonInfo(mi.umpire2 || mh.umpire2),
+      umpire3: formatPersonInfo(mi.umpire3 || mh.umpire3),
+      referee: formatPersonInfo(mi.referee || mh.referee),
+    },
+    series: {
+      name: firstDefined(mh.seriesName, series.name),
+      result: extractSeriesResultText(series),
+      startDate: formatEpochDate(firstDefined(series.startDate, mh.seriesStartDt)),
+      endDate: formatEpochDate(firstDefined(series.endDate, mh.seriesEndDt)),
+    },
+    venueDetails: {
+      city: firstDefined(venue.city),
+      country: firstDefined(venue.country),
+      timezone: firstDefined(venue.timezone),
+      latitude: firstDefined(venue.latitude),
+      longitude: firstDefined(venue.longitude),
+    },
+  };
+}
+
+// bracket-matching version of findMarkerLazy — for top-level ARRAY values
+// like "videoList":[ ... ] / "matchVideos":[ ... ] (findMarkerLazy eken
+// OBJECT values ("{" walin patan gannana) witharak handle wenne).
+function findArrayMarkerLazy(rawChunks, cache, marker, candidateIndices) {
+  const indices = candidateIndices || rawChunks.map((_, i) => i);
+  for (const i of indices) {
+    const decoded = decodeChunk(rawChunks, i, cache);
+    const idx = decoded.indexOf(`"${marker}":[`);
+    if (idx === -1) continue;
+    const bracketStart = decoded.indexOf("[", idx);
+    if (bracketStart === -1) continue;
+    let depth = 0, end = -1;
+    for (let j = bracketStart; j < decoded.length; j++) {
+      const c = decoded[j];
+      if (c === "[") depth++;
+      else if (c === "]") { depth--; if (depth === 0) { end = j; break; } }
+    }
+    if (end === -1) continue;
+    try { return JSON.parse(decoded.slice(bracketStart, end + 1)); } catch (e) { continue; }
+  }
+  return null;
+}
+
+// "matchVideos" array eken id + videoType + title witharak (Press
+// Conference / Analysis wage tag eka) - "videoList" eke videoType
+// nathi welawaka meken enrich karanna use karanawa.
+function extractMatchVideosMeta(rawChunks, cache) {
+  const arr = findArrayMarkerLazy(rawChunks, cache, "matchVideos", undefined);
+  if (!Array.isArray(arr)) return [];
+  return arr
+    .map((v) => ({ id: v && v.id, title: v && v.title, videoType: (v && v.videoType) || undefined }))
+    .filter((v) => v.id);
+}
+
+// Cricbuzz SSR-karana <script type="application/ld+json"> WPSideBar
+// blocks (Featured Videos / Latest News / Latest Photos okkomatama
+// meke pattern ekama) - raw HTML text ekema literal widiyata thiyena
+// nisa chunk-decode karanna one na, kelinma regex karanawa.
+function extractJsonLdSidebars(rawHtml) {
+  const out = { newsArticles: [], photos: [], videos: [] };
+  if (!rawHtml) return out;
+  const scriptRe = /<script type="application\/ld\+json">([\s\S]*?)<\/script>/g;
+  let m;
+  while ((m = scriptRe.exec(rawHtml)) !== null) {
+    let obj;
+    try { obj = JSON.parse(m[1]); } catch (e) { continue; }
+    if (!obj || obj["@type"] !== "WPSideBar" || !Array.isArray(obj.mainEntityOfPage)) continue;
+    for (const item of obj.mainEntityOfPage) {
+      if (!item || typeof item !== "object") continue;
+      if (item["@type"] === "NewsArticle") {
+        out.newsArticles.push({ title: item.name, image: item.image });
+      } else if (item["@type"] === "ImageObject") {
+        out.photos.push({ title: item.name, image: item.image, date: item.datePublished });
+      } else if (item["@type"] === "VideoObject") {
+        out.videos.push({
+          title: item.name,
+          duration: item.duration,
+          link: item.contentUrl,
+          thumbnail: item.thumbnailUrl,
+          date: item.datePublished,
+        });
+      }
+    }
+  }
+  return out;
+}
+
+// "LATEST NEWS" / "LATEST PHOTOS" widiyata thiyena links - anchor href
+// eka + langama thiyena "mb-2.5" title div eka regex ekakin pair
+// karanawa (raw SSR html ekema thiyena nisa chunk-decode one na).
+function extractLinkedItems(rawHtml, pathPrefix, maxResults) {
+  maxResults = maxResults || 8;
+  const items = [];
+  if (!rawHtml) return items;
+  const re = new RegExp('href="(' + escapeRegex(pathPrefix) + '\\/[^"]+)"[^>]*>[\\s\\S]{0,2000}?class="mb-2\\.5">([^<]{2,200})<', "g");
+  let m;
+  const seen = new Set();
+  while ((m = re.exec(rawHtml)) !== null && items.length < maxResults) {
+    const link = m[1];
+    const title = m[2].trim();
+    if (seen.has(link) || !title) continue;
+    seen.add(link);
+    items.push({ title, link: "https://www.cricbuzz.com" + link });
+  }
+  return items;
 }
