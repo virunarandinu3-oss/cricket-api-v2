@@ -1,5 +1,11 @@
 // Cricbuzz eke match eke link eka methanata danna:
+// ================================================================
+// ================================================================
+//                  MATCH LINK EKA METHANATA DANNA
+// ================================================================
 const MATCH_URL = "https://www.cricbuzz.com/live-cricket-scores/154410/jkm-vs-snp-10th-match-caribbean-premier-league-2026";
+// ================================================================
+// ================================================================
 
 const SCORECARD_MARKER = "scorecardApiData";
 const LIVE_MARKER_CANDIDATES = ["miniscore", "matchScoreDetails", "liveApiData", "commentaryApiData", "faceoffApiData"];
@@ -152,8 +158,8 @@ module.exports = async function handler(req, res) {
 
     const result = {
       status: "success",
-      match_id: matchId,
-      score: `${battingTeam} ${runs}/${wickets}`,
+      team: battingTeam,
+      score: `${runs}/${wickets}`,
       overs,
       batsmen,
       bowler: bowlerName,
@@ -173,9 +179,11 @@ module.exports = async function handler(req, res) {
       };
     }
 
-    return res.status(200).json(result);
+    res.setHeader("content-type", "application/json;charset=UTF-8");
+    return res.status(200).send(JSON.stringify(result, null, 2));
   } catch (e) {
-    return res.status(500).json({ status: "error", message: String(e) });
+    res.setHeader("content-type", "application/json;charset=UTF-8");
+    return res.status(500).send(JSON.stringify({ status: "error", message: String(e) }, null, 2));
   }
 };
 
