@@ -1,6 +1,6 @@
 const MATCH_URL =
   process.env.MATCH_URL ||
-  "https://www.cricbuzz.com/live-cricket-scores/154421/slk-vs-gaw-11th-match-caribbean-premier-league-2026";
+  "https://www.cricbuzz.com/live-cricket-scores/167013/sal-vs-itt-27th-match-tamil-nadu-premier-league-2026";
 
 const SCORECARD_MARKER = "scorecardApiData";
 const LIVE_MARKER_CANDIDATES = ["miniscore", "matchScoreDetails", "liveApiData", "commentaryApiData", "faceoffApiData"];
